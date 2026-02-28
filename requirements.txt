@@ -1,0 +1,37 @@
+# Golden Transcription Selection System
+# Install all dependencies with:
+# pip install -r requirements.txt
+
+# Core audio processing
+torchaudio
+ffmpeg-python
+soundfile
+pydub
+audioread
+
+# Speech recognition
+openai-whisper
+faster-whisper
+
+# Forced alignment (future stages)
+whisperx
+
+# Voice activity detection
+silero-vad
+
+# Text processing & NLP
+rapidfuzz
+sacremoses
+pyarabic
+jiwer
+
+# Multilingual models
+transformers
+sentence-transformers
+
+
+# Utilities
+torch
+
+sacremoses langcodes
+openpyxl

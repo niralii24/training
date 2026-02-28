@@ -1,7 +1,3 @@
-Here is your complete `training.md` document.
-
-You can copy this directly into a file named **training.md**.
-
 ---
 
 # Golden Transcription Selection System
@@ -10,7 +6,7 @@ You can copy this directly into a file named **training.md**.
 
 ---
 
-## 1. Problem Restatement
+## 1. Problem Statement
 
 We are given:
 
