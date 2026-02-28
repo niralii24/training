@@ -4,7 +4,7 @@ import requests
 from tqdm import tqdm
 
 EXCEL_FILE = "dataset.xlsx" 
-OUTPUT_DIR = "downloaded_audio"
+OUTPUT_DIR = "test_audio"
 TIMEOUT = 30
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)

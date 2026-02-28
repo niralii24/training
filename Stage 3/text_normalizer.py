@@ -272,3 +272,27 @@ def normalize_all_candidates(candidates, language="en"):
 
     print(f"\nAll {len(candidates)} candidates normalized ✅")
     return normalized
+
+def normalize_text_light(text, language="en"):
+    """
+    Light normalization for SCORING purposes (Stage 5).
+    Only removes punctuation and whitespace — preserves
+    letter variants, diacritics, casing, fillers, and
+    number forms that distinguish candidates from each other.
+    """
+    if not text or not text.strip():
+        return ""
+
+    text = step_unicode(text)
+    text = step_lowercase(text, language)
+    text = step_punctuation(text, language)
+    text = step_whitespace(text)
+    return text
+
+
+def normalize_all_candidates_light(candidates, language="en"):
+    """
+    Lightly normalizes all candidates for Stage 5 scoring.
+    Preserves differences that heavy normalization would destroy.
+    """
+    return [normalize_text_light(c, language) for c in candidates]
