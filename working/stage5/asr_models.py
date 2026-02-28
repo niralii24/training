@@ -1,26 +1,40 @@
-import whisper
 import numpy as np
 import torch
 import librosa
 import os
-import logger
+import logging
 torch.set_grad_enabled(False)
 
-# Ensure cache folder exists
-CACHE_DIR = "D:/hf_cache"
+logger = logging.getLogger(__name__)
+
+# Ensure cache folder exists — respect HF_HOME already set by main_pipeline.py
+CACHE_DIR = os.environ.get("HF_HOME") or os.path.join(os.path.expanduser("~"), "hf_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 
 # =========================================================
-# Whisper Model
+# Whisper Model  (uses faster-whisper — already installed)
 # =========================================================
 
 class WhisperModel:
     def __init__(self, size, device):
-        self.model = whisper.load_model(
+        from faster_whisper import WhisperModel as _FasterWhisper
+        import torch
+        # Resolve 'auto', and gracefully fall back to CPU if CUDA is requested
+        # but not actually available (e.g. CPU-only PyTorch build).
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cuda" and not torch.cuda.is_available():
+            logger.warning("CUDA requested but not available — falling back to CPU")
+            print("⚠️  CUDA not available — using CPU for Whisper")
+            device = "cpu"
+        # float16 requires a CUDA GPU; fall back to int8 on CPU
+        compute = "float16" if device == "cuda" else "int8"
+        self.model = _FasterWhisper(
             size,
             device=device,
-            download_root=CACHE_DIR
+            compute_type=compute,
+            download_root=CACHE_DIR,
         )
 
     def transcribe(self, audio_path=None, audio=None, sr: int = 16000,
@@ -29,28 +43,29 @@ class WhisperModel:
 
         ``language`` should be a short code such as ``'ar'`` or ``'en'``.  Whisper
         will use it to force decoding in that language instead of detecting it.
+
+        faster-whisper accepts either a file path or a float32 numpy array
+        directly, so we pass whichever the caller supplies.
         """
 
         kwargs = dict(
-            temperature=0.2,      # Allow slight randomness for better decoding stability
-            beam_size=10,         # Larger search space (default in many APIs is 5-10)
-            best_of=5,            # Sample 5 hypotheses and pick best — dramatically improves quality
+            temperature=0.2,         # slight randomness for better stability
+            beam_size=10,            # larger search space
             condition_on_previous_text=False,
         )
         if language:
             kwargs["language"] = language
-            # logger.info(f"Transcribing with language hint: {language}")
-        # else:
-            # logger.warning("No language specified. Whisper will auto-detect (may be unreliable).")
-
-        if audio is not None:
-            result = self.model.transcribe(audio, **kwargs)
+            logger.info(f"Transcribing with language hint: {language}")
         else:
-            result = self.model.transcribe(audio_path, **kwargs)
+            logger.warning("No language specified — Whisper will auto-detect.")
 
-        segments = result.get("segments", [])
+        target = audio if audio is not None else audio_path
+        segments_gen, _ = self.model.transcribe(target, **kwargs)
 
-        if not segments:
+        # faster-whisper returns a generator — consume it once into a list
+        raw_segments = list(segments_gen)
+
+        if not raw_segments:
             return dict(
                 text="",
                 confidence=0,
@@ -62,19 +77,26 @@ class WhisperModel:
                 segments=[],
             )
 
-        if offset and segments:
-            for s in segments:
-                if "start" in s:
-                    s["start"] += offset
-                if "end" in s:
-                    s["end"] += offset
+        # Convert Segment named-tuples to plain dicts so downstream code can
+        # use dict access uniformly; apply chunk offset to timestamps here.
+        segments = [
+            {
+                "text": s.text,
+                "start": s.start + offset,
+                "end": s.end + offset,
+                "avg_logprob": s.avg_logprob,
+                "compression_ratio": s.compression_ratio,
+                "no_speech_prob": s.no_speech_prob,
+            }
+            for s in raw_segments
+        ]
 
         confs = [s["avg_logprob"] for s in segments]
-        ents = [s["compression_ratio"] for s in segments]
-        nos = [s["no_speech_prob"] for s in segments]
+        ents  = [s["compression_ratio"] for s in segments]
+        nos   = [s["no_speech_prob"] for s in segments]
 
         return dict(
-            text=result.get("text", ""),
+            text="".join(s["text"] for s in segments),
             confidence=float(np.mean(confs)),
             entropy=float(np.mean(ents)),
             no_speech_prob=float(np.mean(nos)),
@@ -207,27 +229,31 @@ def load_asr_models(config, language: str = None):
             size = name.split(":", 1)[1]
             models.append(WhisperModel(size, device))
 
-        # elif name.startswith("wav2vec2"):
-        #     parts = name.split(":", 1)
+        if name.startswith("wav2vec2"):
+            parts = name.split(":", 1)
 
-        #     if len(parts) > 1 and parts[1].strip():
-        #         model_id = parts[1].strip()
-        #     else:
-        #         # no explicit model requested - try language-aware guess
-        #         if language:
-        #             candidate = f"jonatasgrosman/wav2vec2-large-xlsr-53-{language}"
-        #             try:
-        #                 models.append(Wav2Vec2ASR(candidate, device))
-        #                 continue
-        #             except RuntimeError:
-        #                 # language-specific model not available; fall back
-        #                 pass
+            if len(parts) > 1 and parts[1].strip():
+                model_id = parts[1].strip()
+            else:
+                # no explicit model requested - try language-aware guess
+                if language:
+                    candidate = f"jonatasgrosman/wav2vec2-large-xlsr-53-{language}"
+                    try:
+                        models.append(Wav2Vec2ASR(candidate, device))
+                        continue
+                    except RuntimeError:
+                        # language-specific model not available; fall back
+                        pass
 
-        #         # fall back to a generic multilingual ASR checkpoint that is
-        #         # known to include a tokenizer.  ``mms-1b-all`` covers 1000+
-        #         # languages and is public.
-        #         model_id = "facebook/mms-1b-all"
+                # fall back to a generic multilingual ASR checkpoint that is
+                # known to include a tokenizer.  mms-1b-all covers 1000+
+                # languages and is public.
+                model_id = "facebook/mms-1b-all"
 
-        #     models.append(Wav2Vec2ASR(model_id, device))
+            # resolve device the same way as WhisperModel
+            import torch as _torch
+            if device in ("auto", "cuda") and not _torch.cuda.is_available():
+                device = "cpu"
+            models.append(Wav2Vec2ASR(model_id, device))
 
     return models

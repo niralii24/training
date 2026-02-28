@@ -45,8 +45,10 @@ def run_stage5(audio_path: str, config: dict, language: str = None) -> dict:
     # flatten outputs for summary metrics
     outputs = [o for outs in model_outputs for o in outs]
 
-    # combine the text from each model across chunks
-    texts = [" ".join(o["text"] for o in outs) for outs in model_outputs]
+    # combine the text from each model across chunks; normalize before scoring
+    # so punctuation and case differences don't artificially reduce agreement
+    raw_texts = [" ".join(o["text"] for o in outs) for outs in model_outputs]
+    texts = [normalize_text(t) for t in raw_texts]
 
     agreement_score = compute_agreement_score(texts)
 
@@ -60,7 +62,7 @@ def run_stage5(audio_path: str, config: dict, language: str = None) -> dict:
 
     return {
         "reference_transcript": consensus,
-        "reference_transcripts": texts,
+        "reference_transcripts": raw_texts,  # return originals for readability
         "rss": float(rss),
         "agreement": float(agreement_score),
         "details": outputs,

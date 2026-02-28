@@ -1,6 +1,6 @@
 import os
 import torch
-import torchaudio
+import soundfile as sf
 # WhisperModel is imported lazily once cache locations are configured
 
 # ensure cache dirs exist before any HF download attempts
@@ -31,7 +31,8 @@ def _save_temp(waveform, sample_rate, path="temp_lang.wav"):
     We don't try to avoid the filesystem because the library only accepts a
     filename.  Caller is responsible for removing the file afterwards.
     """
-    torchaudio.save(path, waveform, sample_rate)
+    # soundfile expects (samples,) or (samples, channels), not (channels, samples)
+    sf.write(path, waveform.squeeze().numpy(), sample_rate)
     return path
 
 
@@ -97,7 +98,7 @@ def detect_with_fallback(waveform, sample_rate):
     global whisper_fallback
 
     if waveform.numel() == 0 or waveform.shape[-1] < 1600:
-        return "unknown", 0.0, {}
+        return "unknown", 0.0, {}, ""
 
     if whisper_fallback is None:
         try:
@@ -106,12 +107,12 @@ def detect_with_fallback(waveform, sample_rate):
             whisper_fallback = WhisperModel("medium", device=device, compute_type="int8")
         except Exception as e:
             print(f"⚠️ Failed to load fallback Whisper model: {e}")
-            return "unknown", 0.0, {}
+            return "unknown", 0.0, {}, ""
 
     audio = waveform.squeeze()
     total = len(audio)
     if total == 0:
-        return None, 0.0, {}
+        return "unknown", 0.0, {}, ""
 
     chunk_sz = min(total // 3, 16000 * 10)  # max 10s per chunk
     chunks = []
@@ -140,7 +141,7 @@ def detect_with_fallback(waveform, sample_rate):
             weight = 1.5 if i == 1 else 1.0
             vote_probs[lang] = vote_probs.get(lang, 0.0) + (conf * weight)
             # gather text for quality check
-            all_text.append("".join(s.get("text", "") for s in segments))
+            all_text.append("".join(s.text for s in segments))
         except Exception as e:
             print(f"  ⚠️ Chunk {i+1} failed: {e}")
         finally:
@@ -261,7 +262,8 @@ def detect_language(waveform, sample_rate, metadata=None):
     print(f"Primary result: {p_lang} ({p_conf:.2%})")
 
     # look at text quality, if available
-    transcript = "".join(s.get("text", "") for s in p_segs)
+    # faster_whisper returns Segment objects (named tuples), not dicts — use attribute access
+    transcript = "".join(s.text for s in p_segs)
     if _is_nonsense_text(transcript):
         print("  ⚠️ Primary transcript appears to be non-speech or garbage")
         p_conf = 0.0

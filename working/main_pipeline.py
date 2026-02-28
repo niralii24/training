@@ -3,7 +3,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 os.environ["PYTHONUTF8"] = "1"
 sys.stdout.reconfigure(encoding="utf-8")
 
-CACHE = "C:/Users/Omega/hf_cache"
+CACHE = "C:/Users/Nirali/hf_cache"
 os.environ["HF_HOME"] = CACHE
 os.environ["HUGGINGFACE_HUB_CACHE"] = CACHE
 os.environ["XDG_CACHE_HOME"] = CACHE
@@ -15,14 +15,14 @@ from stage2.language_detector import detect_language
 from stage1.stage1_runner import run_stage1
 
 import torch
-import torchaudio
+import soundfile as sf
 
 
 # ---------- CONFIG ----------
 cfg = {
     "models": [
-        {"name": "whisper:medium", "device": "cuda"},
-        {"name": "wav2vec2", "device": "cpu"},
+        {"name": "whisper:medium", "device": "auto"},
+        {"name": "wav2vec2", "device": "auto"},
     ]
 }
 
@@ -42,14 +42,15 @@ sr = stage1["sample_rate"]
 
 # ---------- SAVE CLEAN AUDIO ----------
 clean_path = "stage1_clean.wav"
-torchaudio.save(clean_path, waveform, sr)
+# soundfile expects (samples,) or (samples, channels), not (channels, samples)
+sf.write(clean_path, waveform.squeeze().numpy(), sr)
 print(f"\nSaved cleaned audio → {clean_path}")
 
 
 # =========================================================
 # STAGE 2 → LANGUAGE DETECTION
 # =========================================================
-lang, conf, probs, method = detect_language(waveform, sr)
+lang, conf, probs, method = detect_language(waveform, sr, metadata=stage1["metadata"])
 
 print(f"Detected language: {lang} (confidence {conf:.2%}, method={method})")
 
