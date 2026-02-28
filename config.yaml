@@ -1,0 +1,8 @@
+# config.yaml
+stage5:
+  models:
+    - whisper:medium      
+  device: cuda
+  # chunking parameters for long audio
+  chunk_size: 30.0      # length of each chunk in seconds
+  chunk_overlap: 1.0    # overlap between chunks to avoid cutting words
