@@ -1,0 +1,14 @@
+from stage5.stage5_runner import run_stage5
+
+config = {
+    "models": [
+        "whisper:medium",
+        "wav2vec2"
+    ],
+    "device": "cuda"
+}
+
+stage5_output = run_stage5("audio.wav", config)
+
+print(stage5_output["reference_transcript"])
+print(stage5_output["rss"])
