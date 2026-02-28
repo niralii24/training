@@ -6,3 +6,13 @@ stage5:
   # chunking parameters for long audio
   chunk_size: 30.0      # length of each chunk in seconds
   chunk_overlap: 1.0    # overlap between chunks to avoid cutting words
+
+stage6:
+  device: cuda            # "cuda" or "cpu"
+  skip_gap_sec: 2.0       # minimum silence gap (s) flagged as a skipped region
+  # Anomaly detection thresholds (override per-run if needed)
+  hallucination:
+    confidence_threshold: 0.35   # word score below this → suspicious
+    uniform_spacing_cv:   0.20   # coefficient of variation below this → too uniform
+    boundary_cluster_frac: 0.65  # fraction of words near boundary to flag
+  overlap_min_sec: 0.02          # minimum word overlap to report

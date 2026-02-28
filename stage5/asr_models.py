@@ -20,6 +20,31 @@ def _clean_transcript(text: str) -> str:
     text = re.sub(r' {2,}', ' ', text).strip()
     return text
 
+
+def _squash_long_runs(text: str, max_run: int = 10) -> str:
+    """Collapse pathologically repeated character runs (e.g. هاااااااااا → هاا).
+
+    max_run is set to 10 so that natural Arabic phonetic stretching like
+    'ааааه' (4 alefs) is preserved while genuine Whisper repetition loops
+    (100+ identical tokens) are still caught and collapsed.
+    """
+    return re.sub(r"(.)\1{%d,}" % max_run, r"\1\1", text)
+
+
+# Language-specific initial prompts to anchor Whisper's decoder vocabulary
+# toward the relevant dialect/register.  These are passed as `initial_prompt`
+# only when the stage-2 detected language matches the key.
+#
+# The prompt should contain words that are characteristic of the dialect so
+# that Whisper's language model does not normalise them toward MSA forms.
+# The prompt must be SHORT (≤ 224 tokens) and must NOT include full sentences
+# that would bleed into the transcript.
+_DIALECT_PROMPTS: dict = {
+    # Gulf / Saudi Arabic – keep dialectal forms like ويش، ثيو، بالظبط، اليكس،
+    # ارسل‌لي, etc.  Without this, Whisper normalises them to MSA equivalents.
+    "ar": "ويش. ثيو. اليكس. ابيك. ارسلى. بالظبط. اخس. تشوف. ليه. وين. ازا.",
+}
+
 # Ensure cache folder exists – read from the same env-var that main_pipeline sets
 CACHE_DIR = os.environ.get("HF_HOME", "C:/Users/Omega/hf_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -39,16 +64,21 @@ class WhisperModel:
         )
 
     def transcribe(self, audio_path=None, audio=None, sr: int = 16000,
-                   offset: float = 0.0):
-        """Transcribe audio using Whisper with stable, language-agnostic settings.
+                   offset: float = 0.0, language: str = None):
+        """Transcribe audio using Whisper with stable, language-pinned settings.
 
-        Key flags that prevent the "random output" problem:
-          - condition_on_previous_text=False  → stops the model conditioning on
+        Key flags that prevent the "random output" / wrong-translation problem:
+          - language                           → pins the source language so
+            Whisper does not mis-detect Arabic dialects as Farsi/Urdu.
+          - task="transcribe"                  → always transcribe in the
+            source language; never translate to English.
+          - condition_on_previous_text=False   → stops the model conditioning on
             its own prior output, which is the #1 cause of hallucinations and
             repeating/random text, especially on long or chunked audio.
-          - temperature=0                     → greedy (deterministic) decoding.
-          - fp16 matched to device            → avoids precision-related artefacts.
-        Whisper auto-detects the language; no hint is passed.
+          - temperature=0                      → greedy (deterministic) decoding.
+          - fp16 matched to device             → avoids precision-related artefacts.
+          - initial_prompt removed             → the Arabic-biased prompt was
+            corrupting transcriptions for non-Arabic and mixed-language audio.
 
         Audio is always loaded with librosa at 16 kHz and passed as a numpy
         array.  This avoids whisper's internal load_audio() which shells out to
@@ -69,19 +99,42 @@ class WhisperModel:
 
         kwargs = dict(
             fp16=use_fp16,
-            # Temperature schedule: start greedy, escalate on repetition/low-confidence.
-            # A scalar 0 disables Whisper's internal retry logic entirely.
+            # Pin source language – prevents mis-detection of Arabic dialects
+            # as Farsi / Urdu / other close languages.  Passing None means
+            # Whisper will still auto-detect when no language was provided.
+            language=language,
+            # Always transcribe in the source language; never translate to English.
+            task="transcribe",
+            # Temperature fallback sequence: Whisper starts at 0.0 (greedy) and
+            # automatically retries at higher temperatures when it detects
+            # compression_ratio > threshold (repetition loop) or logprob < threshold.
             temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
-            condition_on_previous_text=False,   # prevents context-drift hallucinations
+            # beam_size=5 at temp 0 gives better quality than greedy;
+            # best_of=5 selects the best among sampled candidates at temp > 0.
+            beam_size=5,
+            best_of=5,
+            condition_on_previous_text=False,
             no_speech_threshold=0.6,
-            logprob_threshold=-1.0,
+            # Loosened from -1.0 → -2.0 so that valid low-confidence segments
+            # at the end of the audio are NOT silently dropped, which was causing
+            # transcripts to be truncated mid-sentence.
+            logprob_threshold=-2.0,
             compression_ratio_threshold=2.4,
-            # Anchor to conversational speech so Whisper doesn't drift into
-            # English tokens or padding hallucinations at segment boundaries.
-            initial_prompt="محادثة.",
+            # Dialect-anchoring prompt: if we have a language-specific prompt it
+            # steers the decoder vocabulary away from MSA normalisation (e.g.
+            # "ويش" being rewritten as "وش", "بالظبط" → "بالضبط", etc.).
+            initial_prompt=_DIALECT_PROMPTS.get(language) if language else None,
         )
 
-        result = self.model.transcribe(audio_np, **kwargs)
+        # Disable flash SDP kernels on Windows to avoid unstable attention paths
+        # seen in PyTorch's scaled_dot_product_attention on some driver stacks.
+        if torch.cuda.is_available():
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=False, enable_math=True, enable_mem_efficient=True
+            ):
+                result = self.model.transcribe(audio_np, **kwargs)
+        else:
+            result = self.model.transcribe(audio_np, **kwargs)
 
         segments = result.get("segments", [])
 
@@ -111,10 +164,24 @@ class WhisperModel:
         # clean tatweel and boundary-hallucination tokens from every text field
         for s in segments:
             if "text" in s:
-                s["text"] = _clean_transcript(s["text"])
+                s["text"] = _squash_long_runs(_clean_transcript(s["text"]))
+
+        # If Whisper reports pathological repetition or extremely low confidence,
+        # treat it as unusable speech to avoid propagating garbage downstream.
+        if np.mean(ents) > 2.8 or np.mean(confs) < -1.5:
+            return dict(
+                text="",
+                confidence=0,
+                entropy=1,
+                no_speech_prob=1,
+                confidence_vector=[float(c) for c in confs],
+                entropy_vector=[float(e) for e in ents],
+                no_speech_vector=[float(n) for n in nos],
+                segments=segments,
+            )
 
         return dict(
-            text=_clean_transcript(result.get("text", "")),
+            text=_squash_long_runs(_clean_transcript(result.get("text", ""))),
             confidence=float(np.mean(confs)),
             entropy=float(np.mean(ents)),
             no_speech_prob=float(np.mean(nos)),

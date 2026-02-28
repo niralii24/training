@@ -15,15 +15,16 @@ def run_stage5(audio_path: str, config: dict, language: str = None) -> dict:
     bypassed Whisper's internal context handling and was the root cause of
     the 'random output' problem.
 
-    The ``language`` argument is intentionally ignored - Whisper auto-detects
-    the language reliably without any hint.
+    ``language`` should be the ISO-639-1 code detected by stage 2 (e.g. "ar").
+    Pinning the language prevents Whisper from mis-identifying Arabic dialects
+    as Farsi/Urdu on short or noisy clips.
     """
 
     models = load_asr_models(config)
 
     outputs = []
     for model in models:
-        result = model.transcribe(audio_path=audio_path)
+        result = model.transcribe(audio_path=audio_path, language=language)
         outputs.append(result)
 
     texts = [o["text"] for o in outputs]
