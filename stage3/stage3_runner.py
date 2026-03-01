@@ -1,16 +1,15 @@
 import sys
 import os
 
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-STAGE1_DIR = os.path.join(BASE_DIR, "..", "Stage 1")
-STAGE2_DIR = os.path.join(BASE_DIR, "..", "Stage 2")
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR  = os.path.join(BASE_DIR, "..")
 
-sys.path.append(STAGE1_DIR)
-sys.path.append(STAGE2_DIR)
+sys.path.insert(0, PARENT_DIR)
+sys.path.insert(0, BASE_DIR)
 
-from stage1_runner     import run_stage1
-from language_detector import detect_language
-from text_normalizer   import normalize_all_candidates
+from stage1.stage1_runner    import run_stage1
+from stage2.language_detector import detect_language
+from text_normalizer          import normalize_all_candidates
 
 
 def run_stage3(stage2_result, candidates):

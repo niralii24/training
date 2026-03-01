@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Cache / model weights
+hf_cache/
+*.pt
+*.bin
+*.safetensors
+
+# Audio / temp files
+downloaded_audio/
+temp/
+*.wav
+*.mp3
+*.flac
+*.m4a
+
+# Logs / misc
+*.log
+test_output.txt
+.DS_Store
+Thumbs.db

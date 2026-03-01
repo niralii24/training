@@ -57,10 +57,10 @@ def compute_agreement_score(texts):
     scores = []
 
     for i in range(max_len):
-        tokens = [tokens[i] for tokens in token_lists if i < len(tokens)]
-        if not tokens:
+        tokens_at_i = [tl[i] for tl in token_lists if i < len(tl)]
+        if not tokens_at_i:
             continue
-        top = Counter(tokens).most_common(1)[0][1]
-        scores.append(top / len(tokens))
+        top = Counter(tokens_at_i).most_common(1)[0][1]
+        scores.append(top / len(tokens_at_i))
 
     return float(np.mean(scores))

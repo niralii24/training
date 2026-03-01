@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # Point WhisperX's Hugging Face downloads to the same local cache used by the
 # rest of the pipeline, so we never download to two different places.
-CACHE_DIR = os.environ.get("HF_HOME", "C:/Users/Omega/hf_cache")
+CACHE_DIR = os.environ.get("HF_HOME", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hf_cache"))
 os.environ.setdefault("HF_HOME", CACHE_DIR)
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", CACHE_DIR)
 

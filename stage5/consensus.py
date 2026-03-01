@@ -9,12 +9,12 @@ def build_consensus(texts):
     result = []
 
     for i in range(max_len):
-        tokens = [tokens[i] for tokens in token_lists if i < len(tokens)]
+        tokens_at_i = [tl[i] for tl in token_lists if i < len(tl)]
 
-        if not tokens:
+        if not tokens_at_i:
             continue
 
-        most_common = Counter(tokens).most_common(1)[0][0]
+        most_common = Counter(tokens_at_i).most_common(1)[0][0]
         result.append(most_common)
 
     return " ".join(result)

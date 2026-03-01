@@ -46,7 +46,7 @@ _DIALECT_PROMPTS: dict = {
 }
 
 # Ensure cache folder exists – read from the same env-var that main_pipeline sets
-CACHE_DIR = os.environ.get("HF_HOME", "C:/Users/Omega/hf_cache")
+CACHE_DIR = os.environ.get("HF_HOME", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hf_cache"))
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 

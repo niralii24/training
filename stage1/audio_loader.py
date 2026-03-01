@@ -16,8 +16,9 @@ def load_and_standardize_audio(file_path):
     print(f"\nLoading audio file: {file_path}")
 
     converted_path = "converted_audio.wav"
+    ffmpeg_bin = os.environ.get("FFMPEG_PATH", "ffmpeg")
     subprocess.run([
-        r"C:\ffmpeg\bin\ffmpeg.exe",
+        ffmpeg_bin,
         "-y",
         "-i", file_path,
         "-ar", "16000",

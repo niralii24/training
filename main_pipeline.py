@@ -3,17 +3,22 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 os.environ["PYTHONUTF8"] = "1"
 sys.stdout.reconfigure(encoding="utf-8")
 
-CACHE = "C:/Users/Omega/hf_cache"
+CACHE = os.environ.get("HF_HOME", os.path.join(os.path.dirname(os.path.abspath(__file__)), "hf_cache"))
 os.environ["HF_HOME"] = CACHE
 os.environ["HUGGINGFACE_HUB_CACHE"] = CACHE
 os.environ["XDG_CACHE_HOME"] = CACHE
+os.makedirs(CACHE, exist_ok=True)
 
 
 # ---------- IMPORT PIPELINE ----------
-from stage6.stage6_runner import run_stage6
-from stage5.stage5_runner import run_stage5
+from stage6.stage6_runner  import run_stage6
+from stage5.stage5_runner  import run_stage5
+from stage7.stage7_runner  import run_stage7
+from stage8.stage8_runner  import run_stage8
+from stage9.stage9_runner  import run_stage9
+from stage10.stage10_runner import run_stage10
 from stage2.language_detector import detect_language
-from stage1.stage1_runner import run_stage1
+from stage1.stage1_runner  import run_stage1
 
 import torch
 import torchaudio
@@ -119,3 +124,94 @@ for o in align_out['overlapping_misalignments'][:10]:   # cap display at 10
           f"at {o['at_time']:.2f}s  (segs {o['segment_a']}/{o['segment_b']})")
 
 print(f"\n  Alignment Quality Score (AQS) : {align_out['alignment_quality_score']:.4f}")
+
+
+# =========================================================
+# STAGE 7 → ACOUSTIC SIMILARITY SCORING
+# =========================================================
+# Compares each candidate against the ASR reference(s) from Stage 5 using
+# WER + CER, weighted by ASR model agreement variance.
+candidates_for_scoring = out.get("reference_transcripts") or [out["reference_transcript"]]
+
+stage7 = run_stage7(
+    candidates = candidates_for_scoring,
+    stage5_out = out,
+    language   = lang,
+)
+
+print("\n===== STAGE 7 – ACOUSTIC SIMILARITY =====")
+for s in stage7["acoustic_scores"]:
+    print(f"  [{s['index']}] acoustic={s['score']:.4f}  "
+          f"WER={s['mean_wer']:.3f}  CER={s['mean_cer']:.3f}")
+best7 = stage7.get("best_acoustic")
+if best7:
+    print(f"\n  Best candidate : [{best7['index']}] score={best7['score']:.4f}")
+
+
+# =========================================================
+# STAGE 8 → CROSS-TRANSCRIPT CONSENSUS MODELING
+# =========================================================
+# In production: pass the raw human-annotated candidate list loaded from Excel.
+# In single-file test mode: the ASR reference transcripts from Stage 5 are used
+# as stand-in candidates so the consensus logic can still be exercised.
+candidates_for_consensus = candidates_for_scoring
+
+stage8 = run_stage8(
+    candidates = candidates_for_consensus,
+    language   = lang,
+)
+
+# ---------- CONSENSUS RESULTS ----------
+print("\n===== STAGE 8 – CROSS-TRANSCRIPT CONSENSUS =====")
+print(f"  Clusters found  : {stage8['cluster_count']}")
+print(f"  Dominant cluster: {sorted(stage8['dominant_cluster'])}")
+print("\n  Candidate scores:")
+for s in stage8["scored_candidates"]:
+    tag = "dominant" if s["in_dominant_cluster"] else "outlier"
+    print(f"    [{s['index']}] consensus={s['consensus_score']:.4f}  "
+          f"cluster_sim={s['avg_cluster_sim']:.4f}  "
+          f"global_avg={s['global_avg_sim']:.4f}  ({tag})")
+best = stage8["best_candidate"]
+print(f"\n  Best candidate  : [{best['index']}] score={best['consensus_score']:.4f}")
+print(f"  Text            : \"{best['text'][:80]}\"")
+
+
+# =========================================================
+# STAGE 9 → LANGUAGE / GRAMMAR QUALITY CHECK (mT5)
+# =========================================================
+# In production: pass the raw human-annotated candidate list loaded from Excel.
+# In single-file test mode: Stage 5 ASR references are used as stand-in candidates.
+candidates_for_grammar = candidates_for_consensus
+
+stage9 = run_stage9(
+    candidates = candidates_for_grammar,
+    language   = lang,
+    mt5_model  = "google/mt5-small",   # swap to mt5-base/large for better quality
+    device     = "cpu",                # swap to "cuda" if GPU available
+)
+
+# ---------- GRAMMAR RESULTS ----------
+print("\n===== STAGE 9 – GRAMMAR / FLUENCY QUALITY =====")
+for s in stage9["scored_candidates"]:
+    print(f"  [{s['index']}] grammar={s['grammar_score']:.4f}  "
+          f"loss={s['loss']:.4f}  raw={s['raw_score']:.4f}")
+best9 = stage9["best_candidate"]
+print(f"\n  Best candidate  : [{best9['index']}] grammar_score={best9['grammar_score']:.4f}")
+print(f"  Text            : \"{best9['text'][:80]}\"")
+
+
+# =========================================================
+# STAGE 10 → FINAL SCORE COMBINATION → GOLDEN TRANSCRIPT
+# =========================================================
+stage10 = run_stage10(
+    candidates = candidates_for_consensus,
+    stage6_out = align_out,
+    stage7_out = stage7,
+    stage8_out = stage8,
+    stage9_out = stage9,
+    # Optional: override default weights
+    # weights = {"acoustic": 0.30, "consensus": 0.40, "grammar": 0.30},
+)
+
+print(f"\n  GOLDEN TRANSCRIPT → \"{stage10['golden_transcript'][:100]}\"")
+print(f"  Final score : {stage10['final_scores'][0]['final_score']:.4f}")
