@@ -42,7 +42,7 @@ stage6:
 # ================================
 stage8:
   model: xlm-roberta-base
-  device: cpu
+  device: cuda
   max_samples: 20
 
 # ================================

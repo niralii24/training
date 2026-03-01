@@ -11,7 +11,6 @@ Stage 6  - Forced alignment scoring (WhisperX) against EACH transcript
 Stage 7  - Transcript similarity metrics
 Stage 8  - Linguistic grammar scoring (XLM-RoBERTa)
 
-All stages configured via config.yaml
 """
 import sys
 import os
@@ -28,6 +27,7 @@ from stage5.stage5_runner     import run_stage5
 from stage6.stage6_runner     import run_stage6_excel_options
 from stage7.stage7_runner     import run_stage7
 from stage8.stage8_runner     import run_stage8, compute_final_score
+from write_results_to_excel   import add_or_update_columns
 
 
 # ================================================================
@@ -149,15 +149,8 @@ def process_one(audio_id: int, cfg: dict):
     for opt_key in [f"option_{i}" for i in range(1, 6)]:
         result = stage6_result["options"].get(opt_key)
         cell   = cell_refs.get(opt_key, "?")
-        is_correct = bool(correct_opt and opt_key == f"option_{correct_opt}")
-        rank_mark  = ""
-        for rank_i, rk in enumerate(stage6_result["ranked"], 1):
-            if rk == opt_key:
-                rank_mark = f"  #{rank_i}"
-                break
         print(f"\n  {'_'*56}")
-        correct_label = "  <- CORRECT ANSWER" if is_correct else ""
-        print(f"  {opt_key.upper()}  [Excel cell {cell}]{correct_label}{rank_mark}")
+        print(f"  {opt_key.upper()}  [Excel cell {cell}]")
         print(f"  {'_'*56}")
         if result is None:
             print("    (empty or failed - skipped)")
@@ -195,8 +188,7 @@ def process_one(audio_id: int, cfg: dict):
         result = stage6_result["options"][opt_key]
         aqs    = result["alignment_quality_score"]
         cell   = cell_refs.get(opt_key, "?")
-        note   = "<- correct" if (correct_opt and opt_key == f"option_{correct_opt}") else ""
-        print(f"  #{rank_i}  {opt_key:<12}  cell={cell:<4}  AQS={aqs:.4f}  {note}")
+        print(f"  #{rank_i}  {opt_key:<12}  cell={cell:<4}  AQS={aqs:.4f}")
 
     # ── STAGE 7 ────────────────────────────────────────────────
     print("\n" + "="*60)
@@ -216,9 +208,7 @@ def process_one(audio_id: int, cfg: dict):
     for opt_key in [f"option_{i}" for i in range(1, 6)]:
         s7   = stage7_result["options"].get(opt_key)
         cell = cell_refs.get(opt_key, "?")
-        is_correct    = bool(correct_opt and opt_key == f"option_{correct_opt}")
-        correct_label = "  <- CORRECT ANSWER" if is_correct else ""
-        print(f"\n  {opt_key.upper()}  [cell {cell}]{correct_label}")
+        print(f"\n  {opt_key.upper()}  [cell {cell}]")
         if s7 is None:
             print("    (empty or skipped)")
             continue
@@ -240,15 +230,12 @@ def process_one(audio_id: int, cfg: dict):
     for opt_key in [f"option_{i}" for i in range(1, 6)]:
         s8   = stage8_result["options"].get(opt_key)
         cell = cell_refs.get(opt_key, "?")
-        is_correct    = bool(correct_opt and opt_key == f"option_{correct_opt}")
-        correct_label = "  <- CORRECT ANSWER" if is_correct else ""
-        print(f"\n  {opt_key.upper()}  [cell {cell}]{correct_label}")
+        print(f"\n  {opt_key.upper()}  [cell {cell}]")
         if s8 is None:
             print("    (empty or skipped)")
             continue
-        tiebreak_note = "  (+tie-break)" if s8.get("tiebreak") else ""
         print(f"  PPPL={s8['pppl']:.2f}  pppl_score={s8['pppl_score']:.4f}  "
-              f"LGS={s8['lgs']:.4f}{tiebreak_note}")
+              f"LGS={s8['lgs']:.4f}")
     print(f"\n  Stage 8 ranked: {' > '.join(stage8_result['ranked'])}")
 
     # ── FINAL COMBINED RANKING ─────────────────────────────────
@@ -260,7 +247,7 @@ def process_one(audio_id: int, cfg: dict):
     w_lgs = weights["lgs"]
     print(f"  AQS×{w_aqs:.2f}  +  TSS×{w_tss:.2f}  +  LGS×{w_lgs:.2f}")
     print("="*60)
-    print(f"  {'Rank':<6}{'Option':<12}{'AQS':>7}  {'TSS':>7}  {'LGS':>7}  {'FINAL':>9}  Note")
+    print(f"  {'Rank':<6}{'Option':<12}{'AQS':>7}  {'TSS':>7}  {'LGS':>7}  {'FINAL':>9}")
     print(f"  {'_'*60}")
 
     final_scores = {}
@@ -284,21 +271,30 @@ def process_one(audio_id: int, cfg: dict):
         tss_val = s7_res["tss"] if s7_res else 0.0
         lgs_val = s8_res["lgs"] if s8_res else 0.0
         fin     = final_scores[opt_key]
-        cell    = cell_refs.get(opt_key, "?")
-        note    = "<- correct" if (correct_opt and opt_key == f"option_{correct_opt}") else ""
-        if s8_res and s8_res.get("tiebreak"):
-            note = (note + "  [tie-break]").strip()
-        print(f"  {rank_i:<6}{opt_key:<12}{aqs_val:>7.4f}  {tss_val:>7.4f}  {lgs_val:>7.4f}  {fin:>9.4f}  {note}")
+        print(f"  {rank_i:<6}{opt_key:<12}{aqs_val:>7.4f}  {tss_val:>7.4f}  {lgs_val:>7.4f}  {fin:>9.4f}")
 
     winner = final_ranked[0] if final_ranked else None
     if winner:
-        print(f"\n  VERDICT -> {winner}  FINAL SCORE = {final_scores[winner]:.4f}")
-        if correct_opt:
-            expected = f"option_{correct_opt}"
-            if winner == expected:
-                print("  [OK] Correct!")
-            else:
-                print(f"  [!!] Differs from correct answer ({expected})")
+        print(f"\n  DETECTED -> {winner}  FINAL SCORE = {final_scores[winner]:.4f}")
+
+    # ── Write results to Excel immediately ────────────────────
+    row_result = {}
+    for opt_key in [f"option_{i}" for i in range(1, 6)]:
+        s6_res = stage6_result["options"].get(opt_key)
+        s7_res = stage7_result["options"].get(opt_key)
+        s8_res = stage8_result["options"].get(opt_key)
+        row_result[opt_key] = {
+            "aqs":         s6_res["alignment_quality_score"] if s6_res else None,
+            "wer":         s7_res["mean_wer"]               if s7_res else None,
+            "cer":         s7_res["mean_cer"]               if s7_res else None,
+            "tss":         s7_res["tss"]                    if s7_res else None,
+            "lgs":         s8_res["lgs"]                    if s8_res else None,
+            "final_score": final_scores.get(opt_key),
+        }
+    detected_opt = int(winner.split("_")[1]) if winner else None
+    row_result["detected_option"] = detected_opt
+    print(f"\n  Writing results for audio_id={audio_id} to {excel_file} …")
+    add_or_update_columns(excel_file, {str(audio_id): row_result})
 
     return True   # success
 
