@@ -1,70 +1,84 @@
 import torch
+import re
+
 def trim_silence_vad(waveform, sample_rate):
     """
-    Perform a two‑stage trimming pass:
+    Use Silero VAD to:
+      1. Find all speech segments in the audio.
+      2. Concatenate those segments, inserting a short fixed-length silence
+         (300 ms) between consecutive segments.
 
-    1.  Quick energy‑based removal of leading/trailing silence using
-        :func:`trim_silence` so that the VAD doesn't waste time on long
-        empty regions.
-    2.  Run the Silero neural VAD to chop out *non‑speech* segments within
-        the remaining audio and concatenate the speech chunks.
+    This removes multi-second dead air (which causes Whisper to emit `..` /
+    `...` tokens) while keeping natural within-sentence rhythm intact.
+    A generous lead/trail pad is applied around every detected segment so
+    soft onsets (آه, يا, هممم) are never clipped.
 
-    The return value is always a waveform that is no longer than the input
-    (empty audio is possible when nothing is detected) and the duration of
-    the trimmed signal in seconds.
-
-    If the Silero library cannot be imported or the model call fails the
-    function will gracefully fall back to the simple energy‑based
-    ``trim_silence`` implementation.
+    Falls back to simple energy trimming if Silero is unavailable.
     """
-    # stage‑0 energy trimming to help the VAD
-    waveform, _ = trim_silence(waveform, sample_rate)
 
     try:
         from silero_vad import load_silero_vad, get_speech_timestamps
 
         model = load_silero_vad()
-        audio = waveform.squeeze()  # shape -> (N,) for the VAD helper
+        audio = waveform.squeeze()  # (N,)
 
         speech_timestamps = get_speech_timestamps(
             audio,
             model,
             sampling_rate=sample_rate,
-            threshold=0.3,
-            min_speech_duration_ms=100,
-            min_silence_duration_ms=300,
+            threshold=0.35,               # be more permissive to avoid dropouts
+            min_speech_duration_ms=120,   # keep short vocalisations
+            min_silence_duration_ms=800,  # only collapse long pauses
         )
 
-        # if the model returned no segments we simply keep whatever the
-        # energy trimming produced earlier (which may be the entire file)
         if not speech_timestamps:
-            print("⚠️ No speech detected by VAD – returning energy‑trimmed audio")
+            print("⚠️ No speech detected by VAD – returning original audio")
             duration = waveform.shape[1] / sample_rate
             return waveform, duration
 
-        # Use VAD only to find the true start/end of speech content.
-        # Do NOT concatenate individual chunks — removing inter-word silence
-        # creates artificial audio boundaries that confuse Whisper (it inserts
-        # dots, extra spaces, and misreads speech rate / "fasting" artifacts).
-        first_start = speech_timestamps[0]["start"]
-        last_end    = speech_timestamps[-1]["end"]
+        print(f"VAD found {len(speech_timestamps)} speech segment(s)")
 
-        # Generous pads: 500ms lead-in on first word (VAD fires late on soft
-        # onsets), 200ms trail-out so the last word isn't clipped.
-        lead_pad  = int(sample_rate * 0.5)
-        trail_pad = int(sample_rate * 0.2)
-        start = max(0, first_start - lead_pad)
-        end   = min(waveform.shape[1], last_end + trail_pad)
+        # Pad each segment: 400 ms lead-in, 250 ms trail-out.
+        # A wider lead-in gives Whisper more acoustic context to correctly
+        # identify the language before the first voiced segment.
+        lead_pad  = int(sample_rate * 0.40)
+        trail_pad = int(sample_rate * 0.25)
+        # Short silence to insert between concatenated segments (300 ms).
+        gap_samples = int(sample_rate * 0.30)
+        gap = torch.zeros(1, gap_samples, dtype=waveform.dtype)
 
-        trimmed = waveform[:, start:end]
+        chunks = []
+        total = waveform.shape[1]
+        for i, ts in enumerate(speech_timestamps):
+            seg_start = max(0, ts["start"] - lead_pad)
+            seg_end   = min(total, ts["end"]  + trail_pad)
+            chunks.append(waveform[:, seg_start:seg_end])
+            # Insert gap between segments (not after the last one)
+            if i < len(speech_timestamps) - 1:
+                chunks.append(gap)
 
+        trimmed = torch.cat(chunks, dim=1)
         trimmed_duration = trimmed.shape[1] / sample_rate
-        print(f"VAD trimming complete → {trimmed_duration:.2f}s remaining ✅")
+
+        # Fail-safe: if VAD removes too much (likely a miss), keep original audio.
+        # Threshold lowered to 0.40 so that audio with lots of silence (which
+        # causes Whisper to emit hallucinated "..." text) IS actually trimmed
+        # rather than reverting to the full silent original.
+        retention = trimmed_duration / (total / sample_rate)
+        if retention < 0.40:
+            print(
+                f"⚠️ VAD would drop {(1 - retention)*100:.1f}% of audio; "
+                "keeping original waveform instead"
+            )
+            return waveform, total / sample_rate
+
+        print(f"VAD trimming complete → {trimmed_duration:.2f}s (was {total/sample_rate:.2f}s) ✅")
         return trimmed, trimmed_duration
 
     except Exception as e:
         print(f"⚠️ VAD trimming failed ({e}), using basic trimming...")
         return trim_silence(waveform, sample_rate)
+
 def trim_silence(waveform, sample_rate, threshold_db=-40.0):
     """
     Removes silence from the beginning and end of audio using an energy
