@@ -1,10 +1,7 @@
 import os
 import torch
 import torchaudio
-# WhisperModel is imported lazily once cache locations are configured
 
-# ensure cache dirs exist before any HF download attempts
-# prefer environment variables already set (main_pipeline sets them)
 CACHE = os.environ.get("HF_HOME") or os.path.join(os.getcwd(), "hf_cache")
 os.environ["HF_HOME"] = CACHE
 os.environ["HUGGINGFACE_HUB_CACHE"] = CACHE
@@ -16,15 +13,12 @@ try:
 except Exception:
     pass
 
-# models will be loaded lazily on first use; this avoids spending time
-# during import and also makes it easier to catch download errors gracefully
 whisper_primary = None
 whisper_fallback = None
 
-CONFIDENCE_THRESHOLD = 0.70  # primary confidence threshold
+CONFIDENCE_THRESHOLD = 0.70  
 
 
-# ── Helper: save waveform temporarily ────────────────────
 def _save_temp(waveform, sample_rate, path="temp_lang.wav"):
     """Write tensor to disk; helper for faster-whisper interface.
 
@@ -35,12 +29,11 @@ def _save_temp(waveform, sample_rate, path="temp_lang.wav"):
     return path
 
 
-# ── Primary Detection ─────────────────────────────────────
 def detect_with_primary(waveform, sample_rate):
     """
     Primary detection using Whisper small model.
 
-    Fast and accurate for high‑confidence cases.  The model is loaded lazily
+    Fast and accurate for high confidence cases.  The model is loaded lazily
     on first call, which also gives us a chance to fall back if the download
     fails (e.g. no network).
 

@@ -1,23 +1,31 @@
 """
-stage6/aligner.py
------------------
-Thin wrapper around WhisperX forced-alignment.
+aligner.py [FIXED]
+------------------
+Thin wrapper around WhisperX forced-alignment with text normalization.
 
-WhisperX uses a language-specific HuBERT / wav2vec2/MMS model trained with
-CTC labels to snap every word (and optionally every character) to the exact
-frame in the audio waveform.
+FIX: Text is now normalized before alignment to remove punctuation/diacritics
+that have no acoustic signal. This prevents WhisperX from trying to align
+silent tokens, which was causing low confidence scores.
+
+The normalization is applied ONLY to the text passed to WhisperX; the original
+text is preserved in the results for display.
 
 Public API
 ----------
 WhisperXAligner(language, device)
-    .align(audio_path, segments) -> dict
+    .align(audio_path, segments, preserve_original=True) -> dict
         {
-            "segments": [ { "words": [{word, start, end, score}], "chars": [...] } ],
+            "segments": [
+                {
+                    "words": [{word, start, end, score}],
+                    "chars": [...],
+                    "original_text": "...",  # if preserve_original=True
+                }
+            ],
             "word_segments": [...]
         }
 """
-from __future__ import annotations  # MUST be first line: makes all annotations
-                                     # lazy strings on Python 3.8/3.9
+from __future__ import annotations
 
 import os
 import logging
@@ -27,22 +35,53 @@ import librosa
 
 logger = logging.getLogger(__name__)
 
-# Point WhisperX's Hugging Face downloads to the same local cache used by the
-# rest of the pipeline, so we never download to two different places.
+# Point WhisperX's Hugging Face downloads to the same local cache
 CACHE_DIR = os.environ.get("HF_HOME", "C:/Users/Omega/hf_cache")
 os.environ.setdefault("HF_HOME", CACHE_DIR)
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", CACHE_DIR)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Text normalization for alignment
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Arabic diacritics (no acoustic signal)
+ARABIC_DIACRITICS = {
+    '\u064B', '\u064C', '\u064D', '\u064E', '\u064F', '\u0650',
+    '\u0651', '\u0652', '\u0653', '\u0654', '\u0655', '\u0656',
+    '\u0657', '\u0658', '\u0670',
+}
+
+# Punctuation that confuses WhisperX alignment
+ALIGNMENT_PUNCT = set('؟،؛:!.\'"()-[]{}…‹›«»„"‟—–')
+
+
+def _normalize_text_for_alignment(text: str) -> str:
+    """
+    Remove punctuation and diacritics before WhisperX alignment.
+
+    These elements have no acoustic signal, so they confuse CTC-based alignment.
+    Removing them allows WhisperX to focus on actual phonetic content.
+    """
+    if not text:
+        return ""
+    # Remove diacritics
+    text = ''.join(c for c in text if c not in ARABIC_DIACRITICS)
+    # Replace punctuation with spaces
+    text = ''.join(c if c not in ALIGNMENT_PUNCT else ' ' for c in text)
+    # Normalize whitespace
+    text = ' '.join(text.split())
+    return text
+
+
 class WhisperXAligner:
     """
-    Forced-alignment engine backed by WhisperX.
+    Forced-alignment engine backed by WhisperX with smart text normalization.
 
     Parameters
     ----------
     language : str
         ISO-639-1 language code, e.g. ``"ar"``, ``"en"``.
-        WhisperX selects the appropriate pre-trained alignment model.
     device : str
         ``"cuda"`` or ``"cpu"``.
     cache_dir : str | None
@@ -77,8 +116,6 @@ class WhisperXAligner:
         )
 
         # ── load_align_model API varies across WhisperX versions ──────────
-        # Newer builds accept model_dir; older ones only take language_code
-        # and device.  Inspect the signature first, fall back gracefully.
         try:
             sig = inspect.signature(whisperx.load_align_model)
             if "model_dir" in sig.parameters:
@@ -93,7 +130,6 @@ class WhisperXAligner:
                     device=device,
                 )
         except TypeError:
-            # Absolute fallback – positional-only old API
             self.model, self.metadata = whisperx.load_align_model(
                 language, device
             )
@@ -101,9 +137,18 @@ class WhisperXAligner:
         logger.info("Stage6 Aligner: alignment model ready.")
 
     # ------------------------------------------------------------------
-    def align(self, audio_path: str, segments: list[dict]) -> dict:
+    def align(
+        self,
+        audio_path: str,
+        segments: list[dict],
+        preserve_original: bool = True,
+    ) -> dict:
         """
         Run forced alignment on *audio_path* using *segments* from stage 5.
+
+        Text normalization (removal of punctuation/diacritics) is applied
+        before alignment to improve alignment confidence, since punctuation
+        has no acoustic signal and confuses the CTC-based aligner.
 
         Parameters
         ----------
@@ -111,6 +156,9 @@ class WhisperXAligner:
             Path to a mono WAV (any sample rate; WhisperX resamples internally).
         segments : list[dict]
             Stage-5 Whisper segments – must contain ``start``, ``end``, ``text``.
+        preserve_original : bool
+            If True, save the original (non-normalized) text in the output
+            segments for display purposes.
 
         Returns
         -------
@@ -119,6 +167,7 @@ class WhisperXAligner:
                 "segments": [
                     {
                         "start": float, "end": float, "text": str,
+                        "original_text": str,  # if preserve_original=True
                         "words": [{"word", "start", "end", "score"}, …],
                         "chars": [{"char", "start", "end", "score"}, …],
                     },
@@ -132,54 +181,65 @@ class WhisperXAligner:
                            "returning empty alignment.")
             return {"segments": [], "word_segments": []}
 
-        # ── Load audio with librosa (no FFmpeg required) ──────────────────
-        # whisperx.load_audio() calls FFmpeg under the hood which may not be
-        # on PATH.  librosa reads WAV/MP3 via soundfile/audioread without any
-        # external binary.  WhisperX align() accepts a raw float32 numpy array
-        # at 16 kHz, identical to what load_audio() would have returned.
+        # ── Load audio with librosa ──────────────────────────────────────
         WHISPERX_SR = 16000
         audio_np, _ = librosa.load(audio_path, sr=WHISPERX_SR, mono=True)
         audio_np = audio_np.astype("float32")
 
-        clean_segs = _normalise_segments(segments)
+        # ── Normalize text for alignment ──────────────────────────────────
+        # Save original text before normalizing so we can restore it later
+        original_texts = [s.get("text", "") for s in segments]
+        clean_segs = _normalise_segments(segments, normalize_text=True)
 
-        # align() API is stable across recent WhisperX versions
+        # ── Run WhisperX alignment on normalized text ────────────────────
+        logger.info(
+            "Stage6 Aligner: aligning %d segment(s) with normalized text …",
+            len(clean_segs)
+        )
         result = self._wx.align(
             clean_segs,
             self.model,
             self.metadata,
             audio_np,
             self.device,
-            return_char_alignments=True,   # enables phoneme-proxy metrics
+            return_char_alignments=True,
         )
 
-        # ── Normalise return type ─────────────────────────────────────────
-        # Some pre-release builds returned a plain list; current builds return
-        # a TypedDict / plain dict with "segments" and "word_segments" keys.
+        # ── Restore original text in output ──────────────────────────────
         if isinstance(result, list):
-            return {"segments": result, "word_segments": []}
-        if isinstance(result, dict):
-            result = dict(result)                     # shallow copy
+            result = {"segments": result, "word_segments": []}
+        elif isinstance(result, dict):
+            result = dict(result)
             result.setdefault("segments", clean_segs)
             result.setdefault("word_segments", [])
-            return result
 
-        logger.error(
-            "Stage6 Aligner: unexpected align() return type %s; "
-            "returning empty alignment.", type(result)
-        )
-        return {"segments": [], "word_segments": []}
+        if preserve_original and isinstance(result.get("segments"), list):
+            for i, seg in enumerate(result["segments"]):
+                if i < len(original_texts):
+                    seg["original_text"] = original_texts[i]
+
+        logger.info("Stage6 Aligner: alignment complete.")
+        return result
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _normalise_segments(segments: list[dict]) -> list[dict]:
+def _normalise_segments(
+    segments: list[dict],
+    normalize_text: bool = True,
+) -> list[dict]:
     """
     Ensure every segment dict has the mandatory keys WhisperX expects
-    (``start``, ``end``, ``text``) and scrub any heavy numpy/tensor objects
-    that would confuse WhisperX's internal JSON-like processing.
+    and optionally normalize text for better alignment.
+
+    Parameters
+    ----------
+    segments : list[dict]
+        Input segments.
+    normalize_text : bool
+        If True, remove punctuation/diacritics from text before alignment.
     """
     out: list[dict] = []
     for s in segments:
@@ -187,13 +247,17 @@ def _normalise_segments(segments: list[dict]) -> list[dict]:
         end   = s.get("end",   0.0)
         text  = s.get("text",  "")
 
+        # Normalize text if requested
+        if normalize_text:
+            text = _normalize_text_for_alignment(text)
+
         clean: dict = {
             "start": float(start) if start is not None else 0.0,
             "end":   float(end)   if end   is not None else 0.0,
             "text":  str(text)    if text  is not None else "",
         }
 
-        # Pass through any existing word-level data (from a prior partial align)
+        # Pass through any existing word-level data
         if "words" in s and isinstance(s["words"], list):
             clean["words"] = [
                 {

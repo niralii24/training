@@ -1,3 +1,17 @@
+"""
+asr_models_conservative.py
+──────────────────────────
+Conservative cleaning that preserves legitimate Arabic/English words
+while only removing obvious Whisper hallucination artifacts.
+
+Key differences from original:
+  1. Tatweel (kashida) removal is disabled by default
+  2. Character run squashing only for EXTREME repetitions (50+ chars)
+  3. Latin hyphen removal is more conservative
+  4. Option to disable all cleaning if needed
+  5. Separate "strict" mode for when hallucinations are detected
+"""
+
 import whisper
 import numpy as np
 import torch
@@ -5,58 +19,208 @@ import librosa
 import os
 import re
 import logging
+from typing import Tuple, Dict, List, Optional, Any
+
 torch.set_grad_enabled(False)
 
 
-def _clean_transcript(text: str) -> str:
-    """Remove common Whisper hallucination artifacts."""
-    # 1. Strip Arabic tatweel / kashida – never a real ASR output
-    text = re.sub(r'ـ+', '', text)
-    # 2. Remove Latin tokens ending with a hyphen (boundary hallucinations)
-    text = re.sub(r'\b[A-Za-z]+\-\s*', ' ', text)
-    # 3. Collapse sequences of dots/ellipses left by chunk-boundary artifacts
+# =========================================================
+# CONSERVATIVE CLEANING (default - preserves words)
+# =========================================================
+
+def _clean_transcript_conservative(text: str, strict: bool = False) -> str:
+    """
+    Remove ONLY obvious Whisper hallucination artifacts.
+    
+    Conservative mode (strict=False) preserves:
+      ✓ Natural character repetition (e.g., "ااااه" - stretched vocalizations)
+      ✓ Legitimate Arabic words with tatweel
+      ✓ Hyphenated English words
+      ✓ Most punctuation
+    
+    Removes only:
+      ✗ Multiple consecutive ellipses/dots
+      ✗ Excessive whitespace
+      ✗ Obvious repetition loops (if strict=True)
+    
+    Parameters
+    ----------
+    text : str
+        Raw Whisper output
+    strict : bool
+        If True, also remove character runs > 20 (hallucination recovery mode)
+        If False, preserve all character repetition (default)
+    
+    Returns
+    -------
+    str
+        Cleaned text
+    """
+    
+    if not text or not text.strip():
+        return ""
+    
+    # 1. Collapse ONLY multiple ellipses (2+ consecutive dots)
+    #    Preserve single dots for abbreviations, sentence endings, etc.
     text = re.sub(r'\.{2,}', '.', text)
-    # 4. Collapse multiple spaces
+    
+    # 2. Collapse multiple spaces (always safe)
     text = re.sub(r' {2,}', ' ', text).strip()
+    
+    # 3. If strict mode: remove excessive repetition (> 20 chars)
+    #    Otherwise: preserve natural character repetition
+    if strict:
+        # Only for extreme pathological cases
+        text = _squash_extreme_runs(text, max_run=20)
+    
     return text
 
 
-def _squash_long_runs(text: str, max_run: int = 10) -> str:
-    """Collapse pathologically repeated character runs (e.g. هاااااااااا → هاا).
-
-    max_run is set to 10 so that natural Arabic phonetic stretching like
-    'ааааه' (4 alefs) is preserved while genuine Whisper repetition loops
-    (100+ identical tokens) are still caught and collapsed.
+def _squash_extreme_runs(text: str, max_run: int = 20) -> str:
+    """
+    Collapse ONLY pathologically extreme character repetitions.
+    
+    Preserves natural Arabic phonetic stretching like:
+      ✓ "ااااه" (4 alefs) - natural elongation
+      ✓ "هممممم" (5 meems) - vocal stretching
+    
+    Removes obvious hallucinations like:
+      ✗ "هاااااااااااااااااااااااا" (50+ repetitions) - pathological
+      ✗ "............................." (infinite dots) - glitch
+    
+    Parameters
+    ----------
+    text : str
+        Input text
+    max_run : int
+        Only collapse runs longer than this (default: 20)
+        Increase to 50+ for even more conservative approach
+    
+    Returns
+    -------
+    str
+        Text with extreme runs collapsed
     """
     return re.sub(r"(.)\1{%d,}" % max_run, r"\1\1", text)
 
 
-# Language-specific initial prompts to anchor Whisper's decoder vocabulary
-# toward the relevant dialect/register.  These are passed as `initial_prompt`
-# only when the stage-2 detected language matches the key.
-#
-# The prompt should contain words that are characteristic of the dialect so
-# that Whisper's language model does not normalise them toward MSA forms.
-# The prompt must be SHORT (≤ 224 tokens) and must NOT include full sentences
-# that would bleed into the transcript.
+# =========================================================
+# STRICT CLEANING (only use when hallucinations detected)
+# =========================================================
+
+def _clean_transcript_strict(text: str) -> str:
+    """
+    Aggressive cleaning when hallucinations are CONFIRMED.
+    
+    Use this ONLY when:
+      • Compression ratio > 2.8 (repetition detected)
+      • Mean confidence < -1.5 (low quality)
+      • Manual inspection shows garbage output
+    
+    Removes:
+      ✗ Tatweel/kashida characters
+      ✗ Character runs > 10
+      ✗ Latin tokens with hyphens
+      ✗ Multiple ellipses
+      ✗ Excessive whitespace
+    """
+    
+    if not text or not text.strip():
+        return ""
+    
+    # 1. Remove Arabic tatweel (kashida)
+    #    Only do this when we KNOW output is corrupted
+    text = re.sub(r'ـ+', '', text)
+    
+    # 2. Remove Latin tokens ending with hyphen (boundary artifacts)
+    text = re.sub(r'\b[A-Za-z]+\-\s*', ' ', text)
+    
+    # 3. Collapse extreme repetitions (strict mode)
+    text = _squash_extreme_runs(text, max_run=10)
+    
+    # 4. Remove multiple ellipses
+    text = re.sub(r'\.{2,}', '.', text)
+    
+    # 5. Normalize whitespace
+    text = re.sub(r' {2,}', ' ', text).strip()
+    
+    return text
+
+
+def _detect_hallucination(
+    confidence: float,
+    entropy: float,
+    no_speech_prob: float,
+    text: str
+) -> Tuple[bool, str]:
+    """
+    Detect if Whisper output is likely hallucinated garbage.
+    
+    Returns
+    -------
+    (is_hallucinated: bool, reason: str)
+    """
+    
+    reasons = []
+    
+    # Check 1: Pathological repetition (compression ratio > 2.8)
+    if entropy > 2.8:
+        reasons.append(f"extreme_repetition(ratio={entropy:.2f})")
+    
+    # Check 2: Extremely low confidence (< -1.5)
+    if confidence < -1.5:
+        reasons.append(f"very_low_confidence(conf={confidence:.2f})")
+    
+    # Check 3: High no-speech probability
+    if no_speech_prob > 0.8:
+        reasons.append(f"no_speech(prob={no_speech_prob:.2f})")
+    
+    # Check 4: Suspicious text patterns
+    if text:
+        # Excessive single-character repetition in output
+        if re.search(r'(.)\1{50,}', text):
+            reasons.append("pathological_character_loop")
+        
+        # All punctuation (no actual words)
+        if re.match(r'^[\s\.\!؟،؛\-\—]+$', text):
+            reasons.append("only_punctuation")
+    
+    is_hallucinated = len(reasons) > 0
+    reason = " + ".join(reasons) if reasons else ""
+    
+    return is_hallucinated, reason
+
+
+# =========================================================
+# Whisper Model (updated with conservative cleaning)
+# =========================================================
+
+# Language-specific prompts (keep the same)
 _DIALECT_PROMPTS: dict = {
-    # Gulf / Saudi Arabic – keep dialectal forms like ويش، ثيو، بالظبط، اليكس،
-    # ارسل‌لي, etc.  Without this, Whisper normalises them to MSA equivalents.
     "ar": "ويش. ثيو. اليكس. ابيك. ارسلى. بالظبط. اخس. تشوف. ليه. وين. ازا.",
 }
 
-# Ensure cache folder exists – read from the same env-var that main_pipeline sets
 CACHE_DIR = os.environ.get("HF_HOME", "C:/Users/Omega/hf_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 
-# =========================================================
-# Whisper Model
-# =========================================================
-
 class WhisperModel:
-    def __init__(self, size, device):
+    def __init__(self, size, device, conservative_cleaning=True):
+        """
+        Initialize Whisper model.
+        
+        Parameters
+        ----------
+        size : str
+            Model size (tiny, base, small, medium, large)
+        device : str
+            "cuda" or "cpu"
+        conservative_cleaning : bool
+            If True (default), use conservative cleaning that preserves words
+            If False, use strict aggressive cleaning
+        """
         self.device = device
+        self.conservative_cleaning = conservative_cleaning
         self.model = whisper.load_model(
             size,
             device=device,
@@ -65,69 +229,34 @@ class WhisperModel:
 
     def transcribe(self, audio_path=None, audio=None, sr: int = 16000,
                    offset: float = 0.0, language: str = None):
-        """Transcribe audio using Whisper with stable, language-pinned settings.
-
-        Key flags that prevent the "random output" / wrong-translation problem:
-          - language                           → pins the source language so
-            Whisper does not mis-detect Arabic dialects as Farsi/Urdu.
-          - task="transcribe"                  → always transcribe in the
-            source language; never translate to English.
-          - condition_on_previous_text=False   → stops the model conditioning on
-            its own prior output, which is the #1 cause of hallucinations and
-            repeating/random text, especially on long or chunked audio.
-          - temperature=0                      → greedy (deterministic) decoding.
-          - fp16 matched to device             → avoids precision-related artefacts.
-          - initial_prompt removed             → the Arabic-biased prompt was
-            corrupting transcriptions for non-Arabic and mixed-language audio.
-
-        Audio is always loaded with librosa at 16 kHz and passed as a numpy
-        array.  This avoids whisper's internal load_audio() which shells out to
-        FFmpeg and fails when FFmpeg is not on PATH.
         """
-        WHISPER_SR = 16000  # whisper always expects 16 kHz float32
+        Transcribe audio with conservative cleaning by default.
+        """
+        WHISPER_SR = 16000
 
         if audio is not None:
-            # already a numpy array – resample if needed
             if sr != WHISPER_SR:
                 audio = librosa.resample(audio, orig_sr=sr, target_sr=WHISPER_SR)
             audio_np = audio.astype("float32")
         else:
-            # load from file with librosa (no FFmpeg required for WAV/MP3 via soundfile/audioread)
             audio_np, _ = librosa.load(audio_path, sr=WHISPER_SR, mono=True)
 
         use_fp16 = (self.device != "cpu")
 
         kwargs = dict(
             fp16=use_fp16,
-            # Pin source language – prevents mis-detection of Arabic dialects
-            # as Farsi / Urdu / other close languages.  Passing None means
-            # Whisper will still auto-detect when no language was provided.
             language=language,
-            # Always transcribe in the source language; never translate to English.
             task="transcribe",
-            # Temperature fallback sequence: Whisper starts at 0.0 (greedy) and
-            # automatically retries at higher temperatures when it detects
-            # compression_ratio > threshold (repetition loop) or logprob < threshold.
             temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
-            # beam_size=5 at temp 0 gives better quality than greedy;
-            # best_of=5 selects the best among sampled candidates at temp > 0.
             beam_size=5,
             best_of=5,
             condition_on_previous_text=False,
             no_speech_threshold=0.6,
-            # Loosened from -1.0 → -2.0 so that valid low-confidence segments
-            # at the end of the audio are NOT silently dropped, which was causing
-            # transcripts to be truncated mid-sentence.
             logprob_threshold=-2.0,
             compression_ratio_threshold=2.4,
-            # Dialect-anchoring prompt: if we have a language-specific prompt it
-            # steers the decoder vocabulary away from MSA normalisation (e.g.
-            # "ويش" being rewritten as "وش", "بالظبط" → "بالضبط", etc.).
             initial_prompt=_DIALECT_PROMPTS.get(language) if language else None,
         )
 
-        # Disable flash SDP kernels on Windows to avoid unstable attention paths
-        # seen in PyTorch's scaled_dot_product_attention on some driver stacks.
         if torch.cuda.is_available():
             with torch.backends.cuda.sdp_kernel(
                 enable_flash=False, enable_math=True, enable_mem_efficient=True
@@ -148,6 +277,8 @@ class WhisperModel:
                 entropy_vector=[],
                 no_speech_vector=[],
                 segments=[],
+                cleaning_applied="none",
+                hallucination_detected=False,
             )
 
         if offset and segments:
@@ -161,14 +292,40 @@ class WhisperModel:
         ents = [s["compression_ratio"] for s in segments]
         nos = [s["no_speech_prob"] for s in segments]
 
-        # clean tatweel and boundary-hallucination tokens from every text field
+        mean_conf = float(np.mean(confs))
+        mean_ent = float(np.mean(ents))
+        mean_no_speech = float(np.mean(nos))
+        raw_text = result.get("text", "")
+
+        # ── Detect if output is hallucinated ─────────────────────────────
+        is_hallucinated, halluc_reason = _detect_hallucination(
+            mean_conf, mean_ent, mean_no_speech, raw_text
+        )
+
+        # ── Choose cleaning strategy ─────────────────────────────────────
+        if is_hallucinated:
+            # Use STRICT cleaning for confirmed hallucinations
+            cleaned_text = _clean_transcript_strict(raw_text)
+            cleaning_applied = f"strict({halluc_reason})"
+        elif self.conservative_cleaning:
+            # Use CONSERVATIVE cleaning by default
+            cleaned_text = _clean_transcript_conservative(raw_text, strict=False)
+            cleaning_applied = "conservative"
+        else:
+            # No cleaning
+            cleaned_text = raw_text
+            cleaning_applied = "none"
+
+        # Apply cleaning to segments too
         for s in segments:
             if "text" in s:
-                s["text"] = _squash_long_runs(_clean_transcript(s["text"]))
+                if is_hallucinated:
+                    s["text"] = _clean_transcript_strict(s["text"])
+                elif self.conservative_cleaning:
+                    s["text"] = _clean_transcript_conservative(s["text"], strict=False)
 
-        # If Whisper reports pathological repetition or extremely low confidence,
-        # treat it as unusable speech to avoid propagating garbage downstream.
-        if np.mean(ents) > 2.8 or np.mean(confs) < -1.5:
+        # ── Final check: if still pathological after cleaning, flag as empty ──
+        if is_hallucinated and (mean_ent > 2.8 or mean_conf < -1.5):
             return dict(
                 text="",
                 confidence=0,
@@ -178,136 +335,46 @@ class WhisperModel:
                 entropy_vector=[float(e) for e in ents],
                 no_speech_vector=[float(n) for n in nos],
                 segments=segments,
+                cleaning_applied=cleaning_applied,
+                hallucination_detected=True,
             )
 
         return dict(
-            text=_squash_long_runs(_clean_transcript(result.get("text", ""))),
-            confidence=float(np.mean(confs)),
-            entropy=float(np.mean(ents)),
-            no_speech_prob=float(np.mean(nos)),
+            text=cleaned_text,
+            confidence=mean_conf,
+            entropy=mean_ent,
+            no_speech_prob=mean_no_speech,
             confidence_vector=[float(c) for c in confs],
             entropy_vector=[float(e) for e in ents],
             no_speech_vector=[float(n) for n in nos],
             segments=segments,
+            cleaning_applied=cleaning_applied,
+            hallucination_detected=is_hallucinated,
         )
 
 
-# =========================================================
-# Generic Wav2Vec2 ASR wrapper (works for XLSR, MMS, etc.)
-# =========================================================
-
-class Wav2Vec2ASR:
-    """Wrapper around any Wav2Vec2-style CTC model that has a tokenizer/vocab.
-
-    ``model_name`` can be a Hugging Face identifier such as
-    ``facebook/wav2vec2-large-xlsr-53-multilingual`` or ``facebook/mms-1b-all``.
-    The underlying class uses ``AutoProcessor`` and ``AutoModelForCTC`` so the
-    same code works for all fine‑tuned checkpoints. If you accidentally pass a
-    pretrained *base* checkpoint (e.g. ``facebook/wav2vec2-large-xlsr-53`` or
-    ``facebook/mms-300m``) the constructor will raise a helpful error telling
-    you that the model needs to be fine‑tuned first.
+def load_asr_models(config, conservative_cleaning=True):
     """
-
-    def __init__(self, model_name: str, device="cpu"):
-        from transformers import AutoProcessor, AutoModelForCTC
-
-        self.model_name = model_name
-        self.device = device
-
-        # load processor (feature extractor + tokenizer)
-        try:
-            self.processor = AutoProcessor.from_pretrained(model_name)
-        except Exception as e:
-            raise RuntimeError(
-                f"failed to load processor for {model_name}: {e}\n"
-                "make sure this is a *fine-tuned* ASR checkpoint that has a tokenizer/vocab."
-            )
-
-        # load the model itself
-        self.model = AutoModelForCTC.from_pretrained(model_name).to(device)
-        self.model.eval()
-
-    def transcribe(self, audio_path=None, audio=None, sr=16000,
-                   offset=0.0, language: str = None):
-        # same audio handling as before
-        if audio is None:
-            speech, sr = librosa.load(audio_path, sr=sr)
-        else:
-            speech = audio
-
-        proc_kwargs = {
-            "audio": speech,
-            "sampling_rate": sr,
-            "return_tensors": "pt",
-            "padding": True,
-        }
-        if language is not None:
-            # some multilingual models take an explicit language token/field
-            proc_kwargs["language"] = language
-
-        inputs = self.processor(**proc_kwargs).to(self.device)
-
-        with torch.no_grad():
-            logits = self.model(**inputs).logits
-
-        probs = torch.softmax(logits, dim=-1)
-        pred_ids = torch.argmax(probs, dim=-1)
-
-        # use processor to decode, this takes care of blanks/padding
-        text = self.processor.batch_decode(pred_ids)[0]
-
-        confidence = float(torch.mean(torch.max(probs, dim=-1).values))
-        entropy = float((-probs * torch.log(probs + 1e-10)).sum(dim=-1).mean())
-
-        return dict(
-            text=text,
-            confidence=confidence,
-            entropy=entropy,
-            no_speech_prob=0.0,
-            confidence_vector=[],
-            entropy_vector=[],
-            no_speech_vector=[],
-        )
-
-
-def load_asr_models(config):
-    """Create a list of Whisper ASR model instances based on configuration.
-
-    Only Whisper models are supported.  Language detection and language-specific
-    routing have been removed; Whisper auto-detects the language reliably.
+    Create Whisper ASR model instances with optional conservative cleaning.
+    
+    Parameters
+    ----------
+    config : dict
+        Configuration dict with "models" key
+    conservative_cleaning : bool
+        If True (default), use conservative cleaning
+        If False, use strict cleaning
     """
-
     models = []
 
     for entry in config["models"]:
         name = entry["name"]
-        device = entry.get("device", "cpu")   # default cpu
+        device = entry.get("device", "cpu")
 
         if name.startswith("whisper"):
             size = name.split(":", 1)[1]
-            models.append(WhisperModel(size, device))
-
-        # elif name.startswith("wav2vec2"):
-        #     parts = name.split(":", 1)
-
-        #     if len(parts) > 1 and parts[1].strip():
-        #         model_id = parts[1].strip()
-        #     else:
-        #         # no explicit model requested - try language-aware guess
-        #         if language:
-        #             candidate = f"jonatasgrosman/wav2vec2-large-xlsr-53-{language}"
-        #             try:
-        #                 models.append(Wav2Vec2ASR(candidate, device))
-        #                 continue
-        #             except RuntimeError:
-        #                 # language-specific model not available; fall back
-        #                 pass
-
-        #         # fall back to a generic multilingual ASR checkpoint that is
-        #         # known to include a tokenizer.  ``mms-1b-all`` covers 1000+
-        #         # languages and is public.
-        #         model_id = "facebook/mms-1b-all"
-
-        #     models.append(Wav2Vec2ASR(model_id, device))
+            models.append(
+                WhisperModel(size, device, conservative_cleaning=conservative_cleaning)
+            )
 
     return models

@@ -239,7 +239,9 @@ def detect_overlapping_misalignments(
     for i in range(len(flat) - 1):
         a = flat[i]
         b = flat[i + 1]
-        overlap = a["end"] - b["start"]
+
+        # True overlap = intersection of [start, end] intervals
+        overlap = min(a["end"], b["end"]) - max(a["start"], b["start"])
         if overlap > min_overlap:
             overlaps.append({
                 "word_a":      a["word"],
@@ -247,7 +249,7 @@ def detect_overlapping_misalignments(
                 "segment_a":   a["seg_idx"],
                 "segment_b":   b["seg_idx"],
                 "overlap_sec": float(overlap),
-                "at_time":     a["start"],
+                "at_time":     max(a["start"], b["start"]),
                 "score_a":     a["score"],
                 "score_b":     b["score"],
             })
