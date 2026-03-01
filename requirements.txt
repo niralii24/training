@@ -1,0 +1,31 @@
+# Core ML / Audio
+torch
+torchaudio
+numpy
+librosa
+ffmpeg-python
+soundfile
+pydub
+audioread
+
+# ASR Models
+openai-whisper
+faster-whisper
+whisperx
+
+# NLP / Text Processing
+transformers
+sentence-transformers
+sentencepiece
+langcodes
+sacremoses
+pyarabic
+rapidfuzz
+jiwer
+
+# Data / Output
+pandas
+openpyxl
+
+# VAD
+silero-vad
