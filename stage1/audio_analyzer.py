@@ -5,16 +5,30 @@ def trim_silence_vad(waveform, sample_rate):
     """
     Use Silero VAD to:
       1. Find all speech segments in the audio.
-      2. Concatenate those segments, inserting a short fixed-length silence
-         (300 ms) between consecutive segments.
+      2. Concatenate those segments, PRESERVING the natural inter-segment
+         silence duration (capped at 2 s to remove dead air that causes
+         Whisper hallucinations).
 
-    This removes multi-second dead air (which causes Whisper to emit `..` /
-    `...` tokens) while keeping natural within-sentence rhythm intact.
+    WHY proportional gaps matter
+    ----------------------------
+    Using a fixed synthetic gap (e.g. 300 ms everywhere) destroys the
+    acoustic evidence that punctuation marks rely on.  A question mark (؟)
+    or full stop (.) corresponds to a LONGER real pause than a comma (،).
+    If every gap becomes the same 300 ms, Stage 6's punctuation–pause scorer
+    cannot distinguish between transcripts that differ only in punctuation
+    placement.  By preserving relative silence durations we keep that signal
+    intact.
+
     A generous lead/trail pad is applied around every detected segment so
     soft onsets (آه, يا, هممم) are never clipped.
 
     Falls back to simple energy trimming if Silero is unavailable.
     """
+
+    # Maximum silence to keep between segments (longer dead air → Whisper `...`)
+    MAX_GAP_SEC = 2.0
+    # Minimum synthetic silence written between chunks to ensure clean separation
+    MIN_GAP_SEC = 0.12
 
     try:
         from silero_vad import load_silero_vad, get_speech_timestamps
@@ -28,7 +42,9 @@ def trim_silence_vad(waveform, sample_rate):
             sampling_rate=sample_rate,
             threshold=0.35,               # be more permissive to avoid dropouts
             min_speech_duration_ms=120,   # keep short vocalisations
-            min_silence_duration_ms=800,  # only collapse long pauses
+            min_silence_duration_ms=300,  # detect comma-level pauses (≥300 ms)
+                                          # previously 800 ms – too coarse for
+                                          # punctuation boundary detection
         )
 
         if not speech_timestamps:
@@ -43,9 +59,8 @@ def trim_silence_vad(waveform, sample_rate):
         # identify the language before the first voiced segment.
         lead_pad  = int(sample_rate * 0.40)
         trail_pad = int(sample_rate * 0.25)
-        # Short silence to insert between concatenated segments (300 ms).
-        gap_samples = int(sample_rate * 0.30)
-        gap = torch.zeros(1, gap_samples, dtype=waveform.dtype)
+        lead_pad_sec  = lead_pad  / sample_rate  # 0.40 s
+        trail_pad_sec = trail_pad / sample_rate  # 0.25 s
 
         chunks = []
         total = waveform.shape[1]
@@ -53,9 +68,27 @@ def trim_silence_vad(waveform, sample_rate):
             seg_start = max(0, ts["start"] - lead_pad)
             seg_end   = min(total, ts["end"]  + trail_pad)
             chunks.append(waveform[:, seg_start:seg_end])
-            # Insert gap between segments (not after the last one)
+
+            # ── Proportional gap insertion ─────────────────────────────────
+            # Insert gap between segments (not after the last one).
+            # The lead/trail pads already consume some of the original silence,
+            # so subtract them before capping to avoid double-counting.
             if i < len(speech_timestamps) - 1:
-                chunks.append(gap)
+                next_ts = speech_timestamps[i + 1]
+                # Natural silence in original audio between these two segments
+                natural_gap_sec = max(
+                    0.0,
+                    (next_ts["start"] - ts["end"]) / sample_rate,
+                )
+                # Remove the portion already covered by the pads
+                remaining_sec = max(
+                    0.0,
+                    natural_gap_sec - trail_pad_sec - lead_pad_sec,
+                )
+                # Cap extreme dead air; keep at least MIN_GAP_SEC
+                gap_sec     = max(MIN_GAP_SEC, min(remaining_sec, MAX_GAP_SEC))
+                gap_samples = int(sample_rate * gap_sec)
+                chunks.append(torch.zeros(1, gap_samples, dtype=waveform.dtype))
 
         trimmed = torch.cat(chunks, dim=1)
         trimmed_duration = trimmed.shape[1] / sample_rate

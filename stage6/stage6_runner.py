@@ -61,6 +61,7 @@ from .hallucination import (
     detect_skipped_regions,
     detect_overlapping_misalignments,
 )
+from .pause_alignment import compute_punctuation_pause_score
 
 logger = logging.getLogger(__name__)
 
@@ -159,15 +160,52 @@ def run_stage6(
         len(hallucinated), len(skipped), len(overlaps),
     )
 
-    # ── 5. Composite Alignment Quality Score (AQS) ────────────────────────
+    # ── 5a. Fine-grained discriminant signals ───────────────────────────────
+    # Word-confidence std: spread of WhisperX per-word scores.
+    # Two near-identical transcripts often differ here even when means tie.
+    _word_scores = [
+        w["score"]
+        for seg in aligned_segments
+        for w in seg.get("words", [])
+        if w.get("score") is not None
+    ]
+    word_conf_std = float(np.std(_word_scores)) if len(_word_scores) > 1 else 0.0
+
+    # Phoneme-level (character CTC) mean confidence – finer than word mean.
+    phoneme_conf_mean = (
+        phoneme_conf["mean"]
+        if phoneme_conf and phoneme_conf.get("n_chars", 0) > 0
+        else avg_conf
+    )
+
+    # ── 5b. Punctuation–pause alignment score ─────────────────────────────
+    # Measures whether ؟ ، . markers coincide with real audio silences.
+    punct_pause_result = compute_punctuation_pause_score(
+        aligned_segments = aligned_segments,
+        audio_path       = audio_path,
+    )
+    punct_pause_score = punct_pause_result["score"]
+    logger.info(
+        "Stage 6 punct-pause │ score=%.3f  gap_ratio=%.2f  coverage=%.2f  f1=%.3f",
+        punct_pause_score,
+        punct_pause_result["gap_ratio"],
+        punct_pause_result["punct_coverage"],
+        punct_pause_result["f1"],
+    )
+
+    # ── 5c. Composite Alignment Quality Score (AQS) ───────────────────────
     aqs = _compute_aqs(
-        word_ratio      = word_ratio,
-        avg_conf        = avg_conf,
-        unaligned_ratio = unaligned_ratio,
-        timing_dev_mean = timing_dev["mean"],
-        n_hallucinated  = len(hallucinated),
-        skip_fraction   = sum(r["duration"] for r in skipped) / (audio_dur + 1e-8),
-        n_overlaps      = len(overlaps),
+        word_ratio        = word_ratio,
+        avg_conf          = avg_conf,
+        unaligned_ratio   = unaligned_ratio,
+        timing_dev_mean   = timing_dev["mean"],
+        timing_dev_p90    = timing_dev["p90"],
+        phoneme_conf_mean = phoneme_conf_mean,
+        word_conf_std     = word_conf_std,
+        punct_pause_score = punct_pause_score,
+        n_hallucinated    = len(hallucinated),
+        skip_fraction     = sum(r["duration"] for r in skipped) / (audio_dur + 1e-8),
+        n_overlaps        = len(overlaps),
     )
     logger.info("Stage 6 ▶ AQS = %.4f", aqs)
 
@@ -179,6 +217,9 @@ def run_stage6(
         "unaligned_segment_ratio":  unaligned_ratio,
         "avg_alignment_confidence": avg_conf,
         "phoneme_confidence":       phoneme_conf,
+
+        # Punctuation–pause alignment
+        "punctuation_pause_score":  punct_pause_result,
 
         # Anomalies
         "hallucinated_segments":     hallucinated,
@@ -402,24 +443,33 @@ def _load_excel_options(
 
 def _compute_aqs(
     *,
-    word_ratio:      float,
-    avg_conf:        float,
-    unaligned_ratio: float,
-    timing_dev_mean: float,
-    n_hallucinated:  int,
-    skip_fraction:   float,
-    n_overlaps:      int,
+    word_ratio:        float,
+    avg_conf:          float,
+    unaligned_ratio:   float,
+    timing_dev_mean:   float,
+    timing_dev_p90:    float,
+    phoneme_conf_mean: float,
+    word_conf_std:     float,
+    punct_pause_score: float,
+    n_hallucinated:    int,
+    skip_fraction:     float,
+    n_overlaps:        int,
 ) -> float:
     """
-    Alignment Quality Score (AQS) – a single [0, 1] summary of alignment
-    health, suitable for use as a feature in downstream scoring.
+    Alignment Quality Score (AQS) – a single [0, 1] discriminating summary
+    designed to separate nearly-identical transcripts that differ in
+    punctuation placement and word boundaries.
 
-    Component weights
+    Component weights (sum = 1.0)
     -----------------
-    0.35 × word_alignment_ratio          (main accuracy signal)
-    0.25 × avg_alignment_confidence      (model certainty)
-    0.20 × (1 − unaligned_segment_ratio) (segment-level coverage)
-    0.20 × timing_score                  (closeness to Whisper times)
+    0.22 × word_alignment_ratio        – fraction of words with timestamps
+    0.15 × avg_alignment_confidence    – mean WhisperX word-level score
+    0.10 × (1 − unaligned_seg_ratio)   – segment-level coverage
+    0.09 × timing_score_mean           – 1 − mean_dev/3 (Whisper boundary fit)
+    0.06 × timing_score_p90            – 1 − p90_dev/3  (tail alignment fit)
+    0.13 × phoneme_conf_score          – char-level CTC confidence (finer)
+    0.05 × consistency_score           – 1 − norm(word_conf_std)
+    0.20 × punct_pause_score           – punctuation ↔ audio-silence alignment
 
     Penalties (capped)
     ------------------
@@ -427,14 +477,26 @@ def _compute_aqs(
     −0.50 × skip_fraction           (proportional to skipped audio)
     −0.01 per overlapping word pair (max −0.10)
     """
-    # Timing score: 1.0 at 0 s deviation, 0.0 at ≥ 3 s deviation
-    timing_score = float(np.clip(1.0 - timing_dev_mean / 3.0, 0.0, 1.0))
+    # Timing scores: 1.0 at 0 s deviation, 0.0 at ≥ 3 s deviation
+    timing_score_mean = float(np.clip(1.0 - timing_dev_mean / 3.0, 0.0, 1.0))
+    timing_score_p90  = float(np.clip(1.0 - timing_dev_p90  / 3.0, 0.0, 1.0))
+
+    # Phoneme score is already in [0, 1]
+    phoneme_score = float(np.clip(phoneme_conf_mean, 0.0, 1.0))
+
+    # Consistency: low word-conf std → uniform alignment → 1.0.
+    # Std of 0.25 maps to 0 (fully inconsistent for typical CTC outputs).
+    consistency_score = float(np.clip(1.0 - word_conf_std / 0.25, 0.0, 1.0))
 
     base = (
-        0.35 * word_ratio
-        + 0.25 * avg_conf
-        + 0.20 * (1.0 - unaligned_ratio)
-        + 0.20 * timing_score
+        0.22 * word_ratio
+        + 0.15 * avg_conf
+        + 0.10 * (1.0 - unaligned_ratio)
+        + 0.09 * timing_score_mean
+        + 0.06 * timing_score_p90
+        + 0.13 * phoneme_score
+        + 0.05 * consistency_score
+        + 0.20 * float(np.clip(punct_pause_score, 0.0, 1.0))
     )
 
     hallucination_penalty = min(0.30, n_hallucinated * 0.05)

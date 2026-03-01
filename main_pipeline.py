@@ -31,7 +31,7 @@ from stage6.stage6_runner     import run_stage6_excel_options
 # ================================================================
 # CONFIG
 # ================================================================
-AUDIO_ID   = 1                   # matches the audio_id column in Excel
+AUDIO_ID   =  16            # matches the audio_id column in Excel
 AUDIO_FILE = f"{AUDIO_ID}.mp3"  # e.g. "1.mp3"
 EXCEL_FILE = "transcripts.xlsx"
 CLEAN_WAV  = "stage1_clean.wav" # intermediate cleaned audio
@@ -157,6 +157,18 @@ for opt_key in [f"option_{i}" for i in range(1, 6)]:
               f"p10={pc['p10']:.3f}  p90={pc['p90']:.3f}  n_chars={pc['n_chars']}")
     else:
         print("  Phoneme-level confidence  : n/a")
+
+    pps = result.get("punctuation_pause_score", {})
+    if pps:
+        prec_s = f"{pps['precision']:.3f}" if pps.get("precision") is not None else "n/a"
+        rec_s  = f"{pps['recall']:.3f}"    if pps.get("recall")    is not None else "n/a"
+        print(f"  Punct-pause alignment     : score={pps['score']:.3f}  "
+              f"gap_ratio={pps['gap_ratio']:.2f}x  "
+              f"coverage={pps['punct_coverage']:.2f}  "
+              f"f1={pps['f1']:.3f}  "
+              f"prec={prec_s}  rec={rec_s}  "
+              f"n_punct={pps['n_punct_boundaries']}  "
+              f"n_pauses={pps['n_audio_pauses']}")
 
     # Anomalies
     halls  = result["hallucinated_segments"]
