@@ -4,6 +4,15 @@ This project is a modular pipeline for high-quality audio transcription, languag
 
 ---
 
+
+# Usage & Important Notes
+1. **Python Version:** This application works only with Python 3.8. Other versions are not supported.
+2. **Input:** All input audio and candidate transcriptions are read from a specified Excel file. The path to this Excel file must be set in the `config.yaml` file.
+3. **Output:** After processing, the golden transcription, error rates, and detected language are written back to the same Excel file.
+4. Run the pipeline starting from Stage 1; each stage processes and passes data to the next.
+5. Inspect outputs and logs for detailed analysis and results.
+6. This requires GPU (cuda) to work, CPU may not work reliably.
+
 ## Stage 1: Audio Loading & Analysis
 - **Purpose:** Load audio files, standardize format, and analyze quality.
 - **Process:**
@@ -90,13 +99,6 @@ This project is a modular pipeline for high-quality audio transcription, languag
 
 ---
 
-## Usage
-1. Place your audio files in the designated input folder.
-2. Run the pipeline starting from Stage 1; each stage processes and passes data to the next.
-3. Inspect outputs and logs for detailed analysis and results.
-
----
-
 ## Dependencies
 - Python 3.8+
 - PyTorch, torchaudio
@@ -105,4 +107,3 @@ This project is a modular pipeline for high-quality audio transcription, languag
 - Other dependencies as specified in each stage's module
 
 ---
-
