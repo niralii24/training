@@ -1,0 +1,59 @@
+# config.yaml
+
+# ================================
+# GLOBAL
+# ================================
+global:
+  cache_dir: d:/Hackathon/2/working/hf_cache
+  device: cuda
+  seed: 42
+
+# ================================
+# PATHS
+# ================================
+paths:
+  audio_dir: downloaded_audio
+  excel_file: transcripts.xlsx
+  clean_wav: stage1_clean.wav
+
+# ================================
+# STAGE 5 — ASR
+# ================================
+stage5:
+  models:
+    - name: whisper:medium
+      device: cuda
+  # chunking parameters for long audio
+  chunk_size: 30.0      # length of each chunk in seconds
+  chunk_overlap: 1.0    # overlap between chunks to avoid cutting words
+
+stage6:
+  device: cuda            # "cuda" or "cpu"
+  skip_gap_sec: 2.0       # minimum silence gap (s) flagged as a skipped region
+  # Anomaly detection thresholds (override per-run if needed)
+  hallucination:
+    confidence_threshold: 0.35   # word score below this → suspicious
+    uniform_spacing_cv:   0.20   # coefficient of variation below this → too uniform
+    boundary_cluster_frac: 0.65  # fraction of words near boundary to flag
+  overlap_min_sec: 0.02          # minimum word overlap to report
+
+# ================================
+# STAGE 8 — Linguistic Scoring
+# ================================
+stage8:
+  model: xlm-roberta-base
+  device: cuda
+  max_samples: 20
+
+# ================================
+# FINAL SCORING
+# ================================
+batch:
+  clear_cuda_cache: true
+  poll_interval_sec: 30   # seconds to wait when all rows are already processed
+
+final_score:
+  weights:
+    aqs: 0.5
+    tss: 0.45
+    lgs: 0.05
