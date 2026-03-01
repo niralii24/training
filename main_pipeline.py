@@ -11,14 +11,16 @@ os.makedirs(CACHE, exist_ok=True)
 
 
 # ---------- IMPORT PIPELINE ----------
-from stage6.stage6_runner  import run_stage6
-from stage5.stage5_runner  import run_stage5
-from stage7.stage7_runner  import run_stage7
-from stage8.stage8_runner  import run_stage8
-from stage9.stage9_runner  import run_stage9
-from stage10.stage10_runner import run_stage10
+from stage1.stage1_runner   import run_stage1
 from stage2.language_detector import detect_language
-from stage1.stage1_runner  import run_stage1
+from stage3.stage3_runner   import run_stage3
+from stage4.stage4_runner   import run_stage4
+from stage5.stage5_runner   import run_stage5
+from stage6.stage6_runner   import run_stage6
+from stage7.stage7_runner   import run_stage7
+from stage8.stage8_runner   import run_stage8
+from stage9.stage9_runner   import run_stage9
+from stage10.stage10_runner import run_stage10
 
 import torch
 import torchaudio
@@ -63,6 +65,12 @@ print(f"\nSaved cleaned audio → {clean_path}")
 # "random" outputs you were seeing when a wrong hint was supplied.
 lang, conf, probs, method = detect_language(waveform, sr)
 print(f"Detected language: {lang} (confidence {conf:.2%}, method={method})")
+
+# Enrich stage1 metadata with language info so it can feed into Stage 3
+stage1["metadata"]["language"]            = lang
+stage1["metadata"]["language_confidence"] = conf
+stage1["metadata"]["language_probs"]      = probs
+stage1["metadata"]["language_method"]     = method
 
 
 # =========================================================
@@ -127,11 +135,42 @@ print(f"\n  Alignment Quality Score (AQS) : {align_out['alignment_quality_score'
 
 
 # =========================================================
+# STAGE 3 → LANGUAGE-AWARE TEXT NORMALIZATION
+# =========================================================
+# Normalizes all candidate transcripts (punctuation, diacritics, casing, etc.)
+# according to the detected language.
+raw_candidates = out.get("reference_transcripts") or [out["reference_transcript"]]
+
+stage3 = run_stage3(stage1, raw_candidates)
+
+print("\n===== STAGE 3 – TEXT NORMALIZATION =====")
+for i, text in enumerate(stage3["normalized_candidates"]):
+    print(f"  [{i}] {text[:100]}")
+
+
+# =========================================================
+# STAGE 4 → SMART CANDIDATE FILTERING
+# =========================================================
+# Removes candidates that are too short/long, mostly non-target-language,
+# repetitive, or otherwise low-quality.
+stage4 = run_stage4(stage3)
+
+print("\n===== STAGE 4 – CANDIDATE FILTERING =====")
+print(f"  Valid   : {len(stage4['valid_candidates'])}")
+print(f"  Filtered: {len(stage4['filtered_out'])}")
+for f in stage4["filtered_out"]:
+    print(f"  [dropped] {f[:80]}")
+
+# Use filtered+normalized candidates for all downstream stages.
+# Fall back to all normalized candidates if the filter removes everything.
+candidates_for_scoring = stage4["valid_candidates"] or stage3["normalized_candidates"]
+
+
+# =========================================================
 # STAGE 7 → ACOUSTIC SIMILARITY SCORING
 # =========================================================
 # Compares each candidate against the ASR reference(s) from Stage 5 using
 # WER + CER, weighted by ASR model agreement variance.
-candidates_for_scoring = out.get("reference_transcripts") or [out["reference_transcript"]]
 
 stage7 = run_stage7(
     candidates = candidates_for_scoring,
