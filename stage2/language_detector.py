@@ -50,8 +50,9 @@ def detect_with_primary(waveform, sample_rate):
     if whisper_primary is None:
         try:
             from faster_whisper import WhisperModel
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            whisper_primary = WhisperModel("small", device=device, compute_type="int8")
+            # Always CPU: language detection only needs short clips and must not
+            # compete with the Stage-5 Whisper model that stays resident on GPU.
+            whisper_primary = WhisperModel("small", device="cpu", compute_type="int8")
         except Exception as e:
             print(f"⚠️ Failed to load primary Whisper model: {e}")
             return "unknown", 0.0, {}, []
@@ -96,8 +97,8 @@ def detect_with_fallback(waveform, sample_rate):
     if whisper_fallback is None:
         try:
             from faster_whisper import WhisperModel
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            whisper_fallback = WhisperModel("medium", device=device, compute_type="int8")
+            # Always CPU — same reason as primary: avoid GPU memory conflict.
+            whisper_fallback = WhisperModel("medium", device="cpu", compute_type="int8")
         except Exception as e:
             print(f"⚠️ Failed to load fallback Whisper model: {e}")
             return "unknown", 0.0, {}

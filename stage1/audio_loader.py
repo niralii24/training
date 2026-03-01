@@ -1,7 +1,6 @@
-import torchaudio
 import torch
-import subprocess
-import os
+import librosa
+import numpy as np
 
 
 def load_and_standardize_audio(file_path):
@@ -11,27 +10,18 @@ def load_and_standardize_audio(file_path):
     - Mono channel
     - float32 format
 
-    Returns: waveform, sample_rate, duration
+    Returns: waveform (1, N) torch tensor, sample_rate (int), duration (float)
     """
     print(f"\nLoading audio file: {file_path}")
 
-    converted_path = "converted_audio.wav"
-    subprocess.run([
-        r"C:\ffmpeg\bin\ffmpeg.exe",
-        "-y",
-        "-i", file_path,
-        "-ar", "16000",
-        "-ac", "1",
-        "-f", "wav",
-        converted_path
-    ], check=True, capture_output=True)
-    print("Converted to WAV using FFmpeg ✅")
+    TARGET_SR = 16000
+    audio_np, _ = librosa.load(file_path, sr=TARGET_SR, mono=True)
+    audio_np = audio_np.astype(np.float32)
 
-    waveform, sample_rate = torchaudio.load(converted_path)
-    waveform = waveform.to(torch.float32)
-    duration = waveform.shape[1] / sample_rate
-    os.remove(converted_path)
+    # Shape to (1, N) to match torchaudio convention expected by downstream stages
+    waveform = torch.from_numpy(audio_np).unsqueeze(0)
+    duration = audio_np.shape[0] / TARGET_SR
 
     print(f"Duration: {duration:.2f}s")
     print("Audio standardization complete ✅")
-    return waveform, sample_rate, duration
+    return waveform, TARGET_SR, duration
