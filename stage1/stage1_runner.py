@@ -4,23 +4,17 @@ from .audio_analyzer import analyze_audio
 
 def run_stage1(audio_file):
     """
-    Stage 1: Audio Loading & Analysis
-
-    1. Load & standardize audio (16kHz, mono, float32)
-    2. Analyze audio (trim silence, SNR, VAD, noise, metadata)
-
-    Returns waveform + full acoustic metadata for downstream stages.
+    Stage 1: Loads, standardizes, and analyzes audio.
+    Returns waveform and acoustic metadata for downstream stages.
     """
     print("\n" + "=" * 60)
     print("STAGE 1: AUDIO LOADING & ANALYSIS")
     print("=" * 60)
 
-    # Step 1: Load and standardize
     print("\n[1/2] Loading and standardizing audio...")
     waveform, sample_rate, raw_duration = load_and_standardize_audio(audio_file)
 
-    # Step 2: Analyze
-    print("\n[2/2] Analyzing audio quality...")
+    print("[2/2] Analyzing audio quality...")
     waveform, metadata = analyze_audio(waveform, sample_rate, raw_duration)
 
     print("\n" + "=" * 60)
@@ -40,17 +34,12 @@ def run_stage1(audio_file):
     }
 
 
-# ── Test ──────────────────────────────────────────────────
 if __name__ == "__main__":
     import os
 
-    # ── Set your audio folder path here ──────────────────────
     AUDIO_FOLDER = r"C:\Users\Admin\Desktop\golden_transcription_system\training\test_audio"
-
-    # Supported audio formats
     SUPPORTED_FORMATS = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".mp4")
 
-    # Get all audio files from the folder
     audio_files = [
         f for f in os.listdir(AUDIO_FOLDER)
         if f.lower().endswith(SUPPORTED_FORMATS)
@@ -64,9 +53,7 @@ if __name__ == "__main__":
 
         for i, filename in enumerate(audio_files, 1):
             full_path = os.path.join(AUDIO_FOLDER, filename)
-            print(f"\n{'='*60}")
             print(f"Processing file {i}/{len(audio_files)}: {filename}")
-            print(f"{'='*60}")
 
             result = run_stage1(full_path)
             all_results[filename] = result

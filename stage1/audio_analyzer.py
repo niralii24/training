@@ -3,31 +3,11 @@ import re
 
 def trim_silence_vad(waveform, sample_rate):
     """
-    Use Silero VAD to:
-      1. Find all speech segments in the audio.
-      2. Concatenate those segments, PRESERVING the natural inter-segment
-         silence duration (capped at 2 s to remove dead air that causes
-         Whisper hallucinations).
-
-    WHY proportional gaps matter
-    ----------------------------
-    Using a fixed synthetic gap (e.g. 300 ms everywhere) destroys the
-    acoustic evidence that punctuation marks rely on.  A question mark (؟)
-    or full stop (.) corresponds to a LONGER real pause than a comma (،).
-    If every gap becomes the same 300 ms, Stage 6's punctuation–pause scorer
-    cannot distinguish between transcripts that differ only in punctuation
-    placement.  By preserving relative silence durations we keep that signal
-    intact.
-
-    A generous lead/trail pad is applied around every detected segment so
-    soft onsets (آه, يا, هممم) are never clipped.
-
-    Falls back to simple energy trimming if Silero is unavailable.
+    Detects speech segments using Silero VAD and trims silence while preserving
+    proportional inter-segment gaps. Falls back to energy trimming if unavailable.
     """
 
-    # Maximum silence to keep between segments (longer dead air → Whisper `...`)
     MAX_GAP_SEC = 2.0
-    # Minimum synthetic silence written between chunks to ensure clean separation
     MIN_GAP_SEC = 0.12
 
     try:
@@ -40,11 +20,9 @@ def trim_silence_vad(waveform, sample_rate):
             audio,
             model,
             sampling_rate=sample_rate,
-            threshold=0.35,               # be more permissive to avoid dropouts
-            min_speech_duration_ms=120,   # keep short vocalisations
-            min_silence_duration_ms=300,  # detect comma-level pauses (≥300 ms)
-                                          # previously 800 ms – too coarse for
-                                          # punctuation boundary detection
+            threshold=0.35,
+            min_speech_duration_ms=120,
+            min_silence_duration_ms=300,
         )
 
         if not speech_timestamps:
@@ -54,13 +32,10 @@ def trim_silence_vad(waveform, sample_rate):
 
         print(f"VAD found {len(speech_timestamps)} speech segment(s)")
 
-        # Pad each segment: 400 ms lead-in, 250 ms trail-out.
-        # A wider lead-in gives Whisper more acoustic context to correctly
-        # identify the language before the first voiced segment.
         lead_pad  = int(sample_rate * 0.40)
         trail_pad = int(sample_rate * 0.25)
-        lead_pad_sec  = lead_pad  / sample_rate  # 0.40 s
-        trail_pad_sec = trail_pad / sample_rate  # 0.25 s
+        lead_pad_sec  = lead_pad  / sample_rate
+        trail_pad_sec = trail_pad / sample_rate
 
         chunks = []
         total = waveform.shape[1]
@@ -69,23 +44,16 @@ def trim_silence_vad(waveform, sample_rate):
             seg_end   = min(total, ts["end"]  + trail_pad)
             chunks.append(waveform[:, seg_start:seg_end])
 
-            # ── Proportional gap insertion ─────────────────────────────────
-            # Insert gap between segments (not after the last one).
-            # The lead/trail pads already consume some of the original silence,
-            # so subtract them before capping to avoid double-counting.
             if i < len(speech_timestamps) - 1:
                 next_ts = speech_timestamps[i + 1]
-                # Natural silence in original audio between these two segments
                 natural_gap_sec = max(
                     0.0,
                     (next_ts["start"] - ts["end"]) / sample_rate,
                 )
-                # Remove the portion already covered by the pads
                 remaining_sec = max(
                     0.0,
                     natural_gap_sec - trail_pad_sec - lead_pad_sec,
                 )
-                # Cap extreme dead air; keep at least MIN_GAP_SEC
                 gap_sec     = max(MIN_GAP_SEC, min(remaining_sec, MAX_GAP_SEC))
                 gap_samples = int(sample_rate * gap_sec)
                 chunks.append(torch.zeros(1, gap_samples, dtype=waveform.dtype))
@@ -93,10 +61,6 @@ def trim_silence_vad(waveform, sample_rate):
         trimmed = torch.cat(chunks, dim=1)
         trimmed_duration = trimmed.shape[1] / sample_rate
 
-        # Fail-safe: if VAD removes too much (likely a miss), keep original audio.
-        # Threshold lowered to 0.40 so that audio with lots of silence (which
-        # causes Whisper to emit hallucinated "..." text) IS actually trimmed
-        # rather than reverting to the full silent original.
         retention = trimmed_duration / (total / sample_rate)
         if retention < 0.40:
             print(
@@ -114,15 +78,8 @@ def trim_silence_vad(waveform, sample_rate):
 
 def trim_silence(waveform, sample_rate, threshold_db=-40.0):
     """
-    Removes silence from the beginning and end of audio using an energy
-    threshold expressed in decibels below the *peak* level of the file.
-
-    The original implementation used a fixed linear threshold which meant
-    quiet recordings were often treated as entirely silent.  By scaling the
-    threshold to the maximum amplitude we get consistent behaviour regardless
-    of gain.
+    Removes silence using an energy threshold relative to peak amplitude.
     """
-    # convert threshold from dB to linear scale relative to the peak
     peak = waveform.abs().max().item()
     threshold = peak * (10 ** (threshold_db / 20))
     amplitude = waveform.abs().squeeze()
@@ -183,24 +140,15 @@ def estimate_noise_level(waveform):
 
 def detect_voice_activity(waveform, sample_rate):
     """
-    Voice Activity Detection using Silero VAD.
-    A neural network trained specifically to detect speech.
-    Works accurately for any language including Arabic.
-    
-    Returns:
-    - speech_ratio: 0.0 to 1.0
-    - speech_frames: number of frames with speech
-    - total_frames: total frames checked
+    Detects voice activity using Silero VAD.
+    Returns: speech_ratio, speech_frames, total_frames
     """
     try:
         from silero_vad import load_silero_vad, get_speech_timestamps
 
         model = load_silero_vad()
 
-        # Silero needs mono float32 at 16kHz — we already have that ✅
         audio = waveform.squeeze()
-
-        # Get speech timestamps
         speech_timestamps = get_speech_timestamps(
             audio,
             model,
@@ -210,7 +158,6 @@ def detect_voice_activity(waveform, sample_rate):
             min_silence_duration_ms=100,  # ignore very short silences
         )
 
-        # Calculate how much of audio is speech
         total_samples = len(audio)
         speech_samples = sum(
             ts["end"] - ts["start"] for ts in speech_timestamps
@@ -230,7 +177,6 @@ def detect_voice_activity(waveform, sample_rate):
         return speech_ratio, speech_frames, total_frames
 
     except Exception as e:
-        # Fallback to energy-based if Silero fails
         print(f"⚠️ Silero VAD failed ({e}), falling back to energy-based...")
         threshold = 10 ** (-45.0 / 20)
         frame_size = int(sample_rate * 30 / 1000)
@@ -259,17 +205,10 @@ def compute_average_energy(waveform):
 
 def analyze_audio(waveform, sample_rate, raw_duration):
     """
-    Runs all analysis on a standardized waveform.
-
-    Quality metrics such as SNR/voice‑activity are calculated on the *original*
-    recording; trimming is performed afterwards so that the returned waveform
-    represents the version that downstream stages should consume.
-
-    Returns waveform (trimmed) + metadata dict.
+    Analyzes audio quality and trims silence. Returns waveform and metadata.
     """
     print("\n--- Running Audio Analysis ---")
 
-    # --- metrics on raw audio -------------------------------------------------
     snr_db = estimate_snr(waveform)
     noise_level = estimate_noise_level(waveform)
     speech_ratio, speech_frames, total_frames = detect_voice_activity(
@@ -277,7 +216,6 @@ def analyze_audio(waveform, sample_rate, raw_duration):
     )
     avg_energy = compute_average_energy(waveform)
 
-    # --- trim the waveform for downstream use --------------------------------
     waveform, trimmed_duration = trim_silence_vad(waveform, sample_rate)
 
     metadata = {
